@@ -63,7 +63,7 @@ def tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
     if not submit_fn(cfg, payload["weights"]):
         return "submit-failed"
 
-    os.makedirs(os.path.dirname(cfg["state_file"]), exist_ok=True)
+    os.makedirs(os.path.dirname(cfg["state_file"]) or ".", exist_ok=True)
     with open(cfg["state_file"], "w") as f:
         json.dump({"last_applied": payload["epoch_index"]}, f)
     print(f"[sync] applied epoch {payload['epoch_index']} "
@@ -77,7 +77,10 @@ def main() -> None:
           f"master={cfg['master_hotkey']}", flush=True)
     try:
         while True:
-            tick(cfg, now=time.time())
+            try:
+                tick(cfg, now=time.time())
+            except Exception as e:
+                print(f"[sync] tick error: {e}", flush=True)
             time.sleep(cfg["poll_s"])
     except KeyboardInterrupt:
         pass

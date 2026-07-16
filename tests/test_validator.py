@@ -74,3 +74,9 @@ def test_submit_failure_does_not_advance_state(tmp_path):
     # state not written → next tick retries the same epoch
     out = tick(cfg, now=NOW, client=_client(_payload()), submit_fn=lambda c, w: True)
     assert out == "applied"
+
+
+def test_non_dict_response_is_rejected_not_raised(tmp_path):
+    client = httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=[1, 2, 3])))
+    out = tick(_cfg(tmp_path), now=NOW, client=client, submit_fn=lambda c, w: True)
+    assert out == "rejected:malformed"

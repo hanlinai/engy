@@ -22,6 +22,8 @@ def epoch_message(netuid: int, epoch_index: int, digest_hex: str) -> str:
 
 def verify_payload(payload: dict, *, master_hotkey: str, netuid: int, genesis: int,
                    now: float, last_applied: int | None) -> tuple[bool, str]:
+    if not isinstance(payload, dict):
+        return False, "malformed"
     if payload.get("v") != 1:
         return False, "version"
     if payload.get("netuid") != netuid:

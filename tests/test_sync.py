@@ -97,3 +97,10 @@ def test_fetch_weights_hits_the_v1_route():
     p = fetch_weights("https://engy.example", client=client)
     assert seen["url"] == "https://engy.example/api/subnet/v1/weights/latest"
     assert p["epoch_index"] == IDX
+
+
+def test_non_dict_payload_is_malformed():
+    for bad in ([1, 2, 3], "nope", 5, None):
+        ok, reason = verify_payload(bad, master_hotkey=MASTER.ss58_address, netuid=NETUID,
+                                    genesis=GENESIS, now=NOW, last_applied=None)
+        assert ok is False and reason == "malformed"
