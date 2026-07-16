@@ -55,21 +55,21 @@ def tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
         print(f"[sync] fetch failed: {e}", flush=True)
         return "fetch-failed"
 
-    ok, reason = verify_payload(
+    ok, reason, weights = verify_payload(
         payload, master_hotkey=cfg["master_hotkey"], netuid=cfg["netuid"],
         genesis=cfg["genesis"], now=now, last_applied=_last_applied(cfg["state_file"]))
     if not ok:
         print(f"[sync] payload rejected: {reason}", flush=True)
         return f"rejected:{reason}"
 
-    if not submit_fn(cfg, payload["weights"]):
+    if not submit_fn(cfg, weights):
         return "submit-failed"
 
     os.makedirs(os.path.dirname(cfg["state_file"]) or ".", exist_ok=True)
     with open(cfg["state_file"], "w") as f:
         json.dump({"last_applied": payload["epoch_index"]}, f)
     print(f"[sync] applied epoch {payload['epoch_index']} "
-          f"({len(payload['weights'])} hotkeys)", flush=True)
+          f"({len(weights)} hotkeys)", flush=True)
     return "applied"
 
 

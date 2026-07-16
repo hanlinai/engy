@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import httpx
@@ -11,16 +12,28 @@ IDX = 12
 END = GENESIS + 13 * 604800
 NOW = float(END + 3600)
 MASTER = Keypair.create_from_uri("//Alice")
-DIGEST = "cd" * 32
 
 
-def _payload():
+def _result_json(**over):
+    result = {
+        "epoch_end": END, "epoch_index": IDX, "epoch_start": END - 604800,
+        "miners": [], "netuid": 53, "params": {}, "v": 1,
+        "weights": [["5Aaa", 65535]],
+    }
+    result.update(over)
+    return json.dumps(result, sort_keys=True, separators=(",", ":"))
+
+
+def _payload(*, weights_top_level=None):
+    rj = _result_json()
+    digest = hashlib.sha256(rj.encode("utf-8")).hexdigest()
     return {
         "v": 1, "netuid": 53, "epoch_index": IDX,
-        "epoch_start": END - 604800, "epoch_end": END, "digest": DIGEST,
-        "weights": [["5Aaa", 65535]],
+        "epoch_start": END - 604800, "epoch_end": END, "digest": digest,
+        "result_json": rj,
+        "weights": weights_top_level if weights_top_level is not None else [["5Aaa", 65535]],
         "signed_hotkey": MASTER.ss58_address,
-        "signature": MASTER.sign(epoch_message(53, IDX, DIGEST).encode()).hex(),
+        "signature": MASTER.sign(epoch_message(53, IDX, digest).encode()).hex(),
         "signed_at": END + 610,
     }
 
@@ -49,6 +62,20 @@ def test_applied_then_deduplicated(tmp_path):
     assert tick(cfg, now=NOW, client=_client(_payload()),
                 submit_fn=lambda c, w: submitted.append(w) or True) == "rejected:already-applied"
     assert len(submitted) == 1
+
+
+def test_evil_top_level_weights_never_reach_submit(tmp_path):
+    # The core security property: a compromised coordination layer swaps the
+    # display-only top-level `weights` field, but the daemon must submit the
+    # weights extracted from the verified result_json, not the evil field.
+    cfg = _cfg(tmp_path)
+    p = _payload(weights_top_level=[["5Evil", 65535]])
+    submitted = []
+    out = tick(cfg, now=NOW, client=_client(p),
+               submit_fn=lambda c, w: submitted.append(w) or True)
+    assert out == "applied"
+    assert submitted == [[["5Aaa", 65535]]]
+    assert submitted != [p["weights"]]
 
 
 def test_bad_signature_never_reaches_chain(tmp_path):

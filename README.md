@@ -32,12 +32,17 @@ weight vector on chain. CPU-only; no GPU, no database.
     export ENGY_SN53_WALLET=<your wallet> ENGY_SN53_WALLET_HOTKEY=<your hotkey>
     engy-sn53-validator
 
-Every payload is verified before it touches the chain: sr25519 signature over
-`engy-sn53:epoch:v1:<netuid>:<epoch_index>:<digest>`, netuid match, and
-epoch freshness (only the last completed epoch is accepted — a replayed or
-stale payload is ignored and the previous weights stay in place). The raw
-per-miner aggregates behind every digest are public, so any operator can
-recompute a closed epoch and falsify a bad result.
+Every payload is verified before it touches the chain: the validator
+recomputes `sha256(result_json)` and checks it equals the payload's `digest`
+(binding the signature to the exact bytes served, not just a label), verifies
+the sr25519 signature over
+`engy-sn53:epoch:v1:<netuid>:<epoch_index>:<digest>` against that recomputed
+digest, and takes the weight vector from the verified `result_json` — never
+from the top-level `weights` field, which is display metadata only. Netuid
+match and epoch freshness are also checked (only the last completed epoch is
+accepted — a replayed or stale payload is ignored and the previous weights
+stay in place). The raw per-miner aggregates behind every digest are public,
+so any operator can recompute a closed epoch and falsify a bad result.
 
 ## Dev setup
 
