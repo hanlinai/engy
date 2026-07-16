@@ -19,3 +19,13 @@ machine.
 
 Source (protocol, verifier, miner client, incentive mechanism) opens here as
 we approach open miner enrollment.
+
+## Run a validator
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e .
+.venv/bin/pytest tests/ -v
+```
+
+Configure `ENGY_SN53_API` to point to the master validator's weight-sync endpoint, and the light validator will periodically fetch signed epochs and verify them against a pinned master hotkey.
