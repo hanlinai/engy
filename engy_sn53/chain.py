@@ -26,7 +26,7 @@ def submit(cfg: dict, weights: list[list]) -> bool:
         sub = bt.subtensor(network=cfg["network"])
         meta = sub.metagraph(cfg["netuid"])
         uids, ws = resolve_uids(weights, list(meta.hotkeys))
-        if not uids:
+        if not uids or sum(ws) == 0:
             print("[chain] no payload hotkey is registered on chain; keeping last weights",
                   flush=True)
             return False

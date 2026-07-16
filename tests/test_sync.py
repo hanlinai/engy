@@ -78,6 +78,14 @@ def test_rejects_already_applied():
     assert ok
 
 
+def test_rejects_malformed_signature_non_hex():
+    assert verify(payload(signature="zz")) == (False, "signature")
+
+
+def test_rejects_malformed_signature_wrong_length():
+    assert verify(payload(signature="00")) == (False, "signature")
+
+
 def test_fetch_weights_hits_the_v1_route():
     seen = {}
 
