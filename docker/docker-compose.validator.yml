@@ -1,0 +1,52 @@
+# engy sn53 light validator — production compose
+#
+# Watchtower auto-updates the image from GHCR: cut a `v*` tag in the repo and
+# CI publishes ghcr.io/hanlinai/engy:latest, which watchtower pulls within the
+# poll interval and recreates the validator container. State (last_applied)
+# lives in a named volume, so an update never re-submits an already-applied
+# epoch.
+#
+# Setup:
+#   1. cp .env.validator.example .env.validator  and fill it in
+#   2. docker compose --env-file .env.validator -f docker/docker-compose.validator.yml up -d
+#   3. docker compose -f docker/docker-compose.validator.yml logs -f validator
+
+services:
+  validator:
+    image: ghcr.io/hanlinai/engy:latest
+    container_name: engy_sn53_validator
+    restart: unless-stopped
+    # host networking so the chain (subtensor) and the engy.web API are reachable
+    network_mode: host
+    env_file:
+      - ../.env.validator
+    volumes:
+      - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
+      - engy_sn53_data:/var/lib/engy-sn53
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: engy_sn53_watchtower
+    restart: unless-stopped
+    environment:
+      - WATCHTOWER_LABEL_ENABLE=true       # only touch containers we labelled
+      - WATCHTOWER_POLL_INTERVAL=300       # check GHCR every 5 min
+      - WATCHTOWER_CLEANUP=true            # prune the superseded image
+      - WATCHTOWER_INCLUDE_STOPPED=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  engy_sn53_data:

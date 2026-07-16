@@ -1,0 +1,31 @@
+# engy sn53 light validator — local development
+#
+# Builds the image locally from source (no GHCR pull, no watchtower). Use this
+# to test changes before they land on main / a tag.
+#
+# Usage:
+#   docker compose -f docker/docker-compose.validator-dev.yml --env-file .env.validator up --build
+#   docker compose -f docker/docker-compose.validator-dev.yml logs -f validator
+#   docker compose -f docker/docker-compose.validator-dev.yml down
+
+services:
+  validator:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.validator
+    container_name: engy_sn53_validator_dev
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - ../.env.validator
+    volumes:
+      - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
+      - engy_sn53_dev_data:/var/lib/engy-sn53
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  engy_sn53_dev_data:

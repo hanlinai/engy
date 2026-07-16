@@ -1,0 +1,44 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Controller scratch
+.superpowers/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs / local state
+logs/
+*.log
+state.json
+
+# Docker (don't ship the build context's own docker files into the image)
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Docs (keep only README)
+*.md
+!README.md
