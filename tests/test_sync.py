@@ -104,3 +104,42 @@ def test_non_dict_payload_is_malformed():
         ok, reason = verify_payload(bad, master_hotkey=MASTER.ss58_address, netuid=NETUID,
                                     genesis=GENESIS, now=NOW, last_applied=None)
         assert ok is False and reason == "malformed"
+
+
+def test_rejects_bytes_wrapped_signature():
+    # substrate-interface's Keypair.verify silently retries with <Bytes>...</Bytes>
+    # wrapping (as used by polkadot{.js}extension-signed messages). The
+    # cross-repo contract is raw-bytes-only signing — a signature over the
+    # wrapped message must be rejected, not accepted via fallback retry.
+    msg = epoch_message(NETUID, IDX, DIGEST)
+    wrapped = b"<Bytes>" + msg.encode() + b"</Bytes>"
+    sig = MASTER.sign(wrapped).hex()
+    assert verify(payload(signature=sig)) == (False, "signature")
+
+
+def test_rejects_bool_epoch_index():
+    assert verify(payload(epoch_index=True))[0] is False
+    assert verify(payload(epoch_index=False))[0] is False
+
+
+def test_rejects_missing_weights():
+    p = payload()
+    del p["weights"]
+    assert verify(p) == (False, "malformed")
+
+
+def test_rejects_non_list_weights():
+    assert verify(payload(weights="nope")) == (False, "malformed")
+
+
+def test_rejects_weights_with_non_pair_entry():
+    assert verify(payload(weights=[["5Aaa", 100], "not-a-pair"])) == (False, "malformed")
+
+
+def test_rejects_weights_with_out_of_range_value():
+    assert verify(payload(weights=[["5Aaa", 70000]])) == (False, "malformed")
+
+
+def test_accepts_well_formed_weights():
+    ok, reason = verify(payload(weights=[["5Aaa", 0], ["5Bbb", 65535]]))
+    assert ok, reason

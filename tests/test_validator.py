@@ -3,8 +3,8 @@ import json
 import httpx
 from substrateinterface import Keypair
 
-from engy_sn53.sync import epoch_message
-from engy_sn53.validator import tick
+from engy_sn53.sync import epoch_message, MAX_RESPONSE_BYTES
+from engy_sn53.validator import tick, _last_applied
 
 GENESIS = 1784505600
 IDX = 12
@@ -80,3 +80,31 @@ def test_non_dict_response_is_rejected_not_raised(tmp_path):
     client = httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=[1, 2, 3])))
     out = tick(_cfg(tmp_path), now=NOW, client=client, submit_fn=lambda c, w: True)
     assert out == "rejected:malformed"
+
+
+def test_oversized_response_is_treated_as_fetch_failure(tmp_path):
+    huge = b"[" + b"1" * (MAX_RESPONSE_BYTES + 1) + b"]"
+    client = httpx.Client(transport=httpx.MockTransport(
+        lambda req: httpx.Response(200, content=huge,
+                                    headers={"content-type": "application/json"})))
+    out = tick(_cfg(tmp_path), now=NOW, client=client, submit_fn=lambda c, w: True)
+    assert out == "fetch-failed"
+
+
+def test_last_applied_survives_corrupt_state_file(tmp_path):
+    state = tmp_path / "state.json"
+    # non-int last_applied
+    state.write_text(json.dumps({"last_applied": "twelve"}))
+    assert _last_applied(str(state)) is None
+    # bool last_applied (bool is a subclass of int — must not pass through)
+    state.write_text(json.dumps({"last_applied": True}))
+    assert _last_applied(str(state)) is None
+    # non-dict top-level JSON
+    state.write_text(json.dumps([1, 2, 3]))
+    assert _last_applied(str(state)) is None
+    # invalid JSON entirely
+    state.write_text("not json at all")
+    assert _last_applied(str(state)) is None
+    # a genuinely valid file still round-trips
+    state.write_text(json.dumps({"last_applied": 7}))
+    assert _last_applied(str(state)) == 7

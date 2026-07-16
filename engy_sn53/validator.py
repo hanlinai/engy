@@ -39,8 +39,10 @@ def load_config() -> dict:
 def _last_applied(path: str) -> int | None:
     try:
         with open(path) as f:
-            return json.load(f).get("last_applied")
-    except (OSError, ValueError):
+            data = json.load(f)
+        v = data.get("last_applied") if isinstance(data, dict) else None
+        return v if isinstance(v, int) and not isinstance(v, bool) else None
+    except (OSError, ValueError, AttributeError, TypeError):
         return None
 
 
