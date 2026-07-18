@@ -1,0 +1,44 @@
+# engy sn53 light validator — staging compose
+#
+# Same as production but tracks the `:staging` tag (published by CI on every
+# push to main), so you can soak a pre-release build before cutting a `v*` tag
+# that promotes it to `:latest`. Watchtower still auto-updates.
+
+services:
+  validator:
+    image: ghcr.io/hanlinai/engy:staging
+    container_name: engy_sn53_validator_staging
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - ../.env.validator
+    volumes:
+      - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
+      - engy_sn53_staging_data:/var/lib/engy-sn53
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: engy_sn53_watchtower_staging
+    restart: unless-stopped
+    environment:
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_POLL_INTERVAL=120
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_INCLUDE_STOPPED=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  engy_sn53_staging_data:

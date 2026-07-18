@@ -1,0 +1,47 @@
+# engy sn53 — light validator image
+#
+# Syncs the master-signed weight vector from the engy.web API, verifies it,
+# and submits it on chain. CPU-only; no GPU, no database.
+#
+# Build (from repo root):
+#   docker build -f docker/Dockerfile.validator -t engy-sn53-validator .
+#
+# Run:
+#   docker run --network host --env-file .env.validator \
+#     -v ~/.bittensor/wallets:/root/.bittensor/wallets:ro \
+#     -v engy_sn53_data:/var/lib/engy-sn53 \
+#     engy-sn53-validator
+
+FROM python:3.11-slim
+
+# git/curl for pip VCS installs and health probes; build-essential + libssl/pkg-config
+# cover the native wheels bittensor pulls in when a manylinux wheel is unavailable.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        git curl build-essential pkg-config libssl-dev && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ── Python package + chain extra (bittensor for set_weights) ─────
+COPY pyproject.toml VERSION README.md ./
+COPY validator/ validator/
+
+RUN pip install --no-cache-dir -e ".[chain]"
+
+# ── Persistent state dir (last_applied survives auto-update restarts) ──
+RUN mkdir -p /var/lib/engy-sn53
+
+# ── Entrypoint ──────────────────────────────────────────────────
+COPY docker/entrypoint-validator.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# ── Environment defaults (override via --env-file .env.validator) ──
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    ENGY_SN53_NETUID=53 \
+    ENGY_SN53_NETWORK=finney \
+    ENGY_SN53_POLL_S=600 \
+    ENGY_SN53_STATE_FILE=/var/lib/engy-sn53/state.json
+
+ENTRYPOINT ["/entrypoint.sh"]
