@@ -16,7 +16,7 @@ services:
     image: ghcr.io/hanlinai/engy:latest
     container_name: engy_sn53_validator
     restart: unless-stopped
-    # host networking so the chain (subtensor) and the engy.web API are reachable
+    # host networking so the chain (subtensor) and the engy provider API are reachable
     network_mode: host
     env_file:
       - ../.env.validator

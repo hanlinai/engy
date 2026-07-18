@@ -1,4 +1,4 @@
-from engy_sn53.chain import resolve_uids
+from engy_sn53.chain import resolve_uids, skipped_hotkeys
 
 
 def test_maps_hotkeys_to_uids_in_uid_order():
@@ -19,3 +19,12 @@ def test_all_unknown_is_empty():
 def test_all_zero_stays_zero():
     uids, ws = resolve_uids([["5A", 0], ["5B", 0]], ["5A", "5B"])
     assert uids == [0, 1] and ws == [0, 0]
+
+
+def test_skipped_hotkeys_lists_unregistered_in_payload_order():
+    assert skipped_hotkeys([["5Gone", 10], ["5A", 20], ["5Also", 30]],
+                           ["5A", "5B"]) == ["5Gone", "5Also"]
+
+
+def test_skipped_hotkeys_empty_when_all_registered():
+    assert skipped_hotkeys([["5A", 10], ["5B", 20]], ["5A", "5B"]) == []

@@ -1,4 +1,4 @@
-"""The light-validator loop: poll engy.web, verify, set weights (spec §2).
+"""The light-validator loop: poll the engy provider API, verify, set weights (spec §2).
 
 Failure posture (spec §10): on ANY failure — API down, bad signature, stale
 epoch, chain error — do nothing. The chain persists the last submitted

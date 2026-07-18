@@ -22,7 +22,8 @@ we approach open miner enrollment.
 
 ## Run a light validator
 
-The light validator syncs the master-signed epoch result from the engy API,
+The light validator syncs the master-signed epoch result from the engy
+provider API,
 verifies the signature against the pinned master hotkey, and submits the same
 weight vector on chain. CPU-only; no GPU, no database.
 
@@ -48,7 +49,7 @@ production tracks); pushing to `main` publishes `:staging` for soak-testing via
 ### Without Docker
 
     pip install -e .[chain]
-    export ENGY_SN53_API=https://engy.ai
+    export ENGY_SN53_API=https://provider.engy.ai
     export ENGY_SN53_MASTER_HOTKEY=<published master hotkey>
     export ENGY_SN53_WALLET=<your wallet> ENGY_SN53_WALLET_HOTKEY=<your hotkey>
     engy-sn53-validator

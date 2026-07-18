@@ -20,12 +20,22 @@ def resolve_uids(weights: list[list], hotkeys_on_chain: list[str]) -> tuple[list
     return [uid for uid, _ in scaled], [w for _, w in scaled]
 
 
+def skipped_hotkeys(weights: list[list], hotkeys_on_chain: list[str]) -> list[str]:
+    registered = set(hotkeys_on_chain)
+    return [hk for hk, _ in weights if hk not in registered]
+
+
 def submit(cfg: dict, weights: list[list]) -> bool:
     try:
         import bittensor as bt
         sub = bt.subtensor(network=cfg["network"])
         meta = sub.metagraph(cfg["netuid"])
-        uids, ws = resolve_uids(weights, list(meta.hotkeys))
+        hotkeys = list(meta.hotkeys)
+        skipped = skipped_hotkeys(weights, hotkeys)
+        if skipped:
+            print(f"[chain] {len(skipped)} payload hotkey(s) not registered on chain, "
+                  f"skipped: {', '.join(skipped)}", flush=True)
+        uids, ws = resolve_uids(weights, hotkeys)
         if not uids or sum(ws) == 0:
             print("[chain] no payload hotkey is registered on chain; keeping last weights",
                   flush=True)
