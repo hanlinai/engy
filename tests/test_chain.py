@@ -1,4 +1,4 @@
-from engy_sn53.chain import resolve_uids, skipped_hotkeys
+from validator.chain import resolve_uids, skipped_hotkeys
 
 
 def test_maps_hotkeys_to_uids_in_uid_order():

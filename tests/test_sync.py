@@ -4,7 +4,7 @@ import json
 import httpx
 from substrateinterface import Keypair
 
-from engy_sn53.sync import epoch_index, epoch_message, verify_payload, fetch_weights
+from validator.sync import epoch_index, epoch_message, verify_payload, fetch_weights
 
 GENESIS = 1784505600
 NETUID = 53

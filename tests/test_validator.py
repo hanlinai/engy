@@ -4,8 +4,8 @@ import json
 import httpx
 from substrateinterface import Keypair
 
-from engy_sn53.sync import epoch_message, MAX_RESPONSE_BYTES
-from engy_sn53.validator import tick, _last_applied
+from validator.sync import epoch_message, MAX_RESPONSE_BYTES
+from validator.validator import tick, _last_applied
 
 GENESIS = 1784505600
 IDX = 12

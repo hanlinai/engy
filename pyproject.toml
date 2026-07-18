@@ -17,7 +17,7 @@ dev = ["pytest>=8.0"]
 chain = ["bittensor>=9.0"]
 
 [project.scripts]
-engy-sn53-validator = "engy_sn53.validator:main"
+engy-sn53-validator = "validator.validator:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["engy_sn53"]
+packages = ["validator"]

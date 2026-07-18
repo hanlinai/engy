@@ -25,7 +25,7 @@ WORKDIR /app
 
 # ── Python package + chain extra (bittensor for set_weights) ─────
 COPY pyproject.toml VERSION README.md ./
-COPY engy_sn53/ engy_sn53/
+COPY validator/ validator/
 
 RUN pip install --no-cache-dir -e ".[chain]"
 

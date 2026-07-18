@@ -13,7 +13,7 @@ payload contract (`v`, `netuid`, `epoch_index`, `digest`, `result_json`,
 `engy-sn53:epoch:v1:<netuid>:<epoch_index>:<digest>`, so no request or
 verification code changes.
 
-uid↔hotkey matching is already enforced: `resolve_uids` (engy_sn53/chain.py)
+uid↔hotkey matching is already enforced: `resolve_uids` (validator/chain.py)
 syncs the metagraph at submit time and maps payload hotkeys to uids via
 `metagraph.hotkeys`; a hotkey not registered on chain resolves to no uid and
 is never submitted. A uid whose hotkey has changed (dereg/re-reg) cannot
