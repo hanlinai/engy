@@ -92,8 +92,8 @@ which is exactly the property a permissionless miner set needs.
            │   auth · billing · proof tee     │
            │   round-robin + prefix affinity  │
            └──────────┬───────────────┬───────┘
-            routed     │               │    routed
-            equally    ▼               ▼    equally
+            routed    │               │    routed
+            equally   ▼               ▼    equally
          ┌────────────────────┐  ┌─────────────────────┐
          │  1st-party cluster │  │    subnet miners    │
          │  trusted, always   │  │  permissionless,    │
