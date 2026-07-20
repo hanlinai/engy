@@ -184,3 +184,52 @@ async def test_a_200_stream_that_yields_no_tokens_is_a_failure():
 
     assert not r.ok
     assert r.error == "empty-stream"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_deltas_count_as_output_tokens():
+    # qwen3.6 streams its chain of thought as `reasoning_content`. Those are
+    # generated tokens the user pays for and waits on, so they count.
+    def handler(request):
+        chunks = [{"choices": [{"delta": {"reasoning_content": "think"}}]},
+                  {"choices": [{"delta": {"reasoning_content": "more"}}]},
+                  {"choices": [{"delta": {"content": "answer"}}]}]
+        body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks)
+        return httpx.Response(200, content=(body + "data: [DONE]\n\n").encode())
+
+    async with httpx.AsyncClient(transport=transport_of(handler)) as client:
+        r = await one_request(client, cfg(), index=0)
+
+    assert r.ok
+    assert r.output_tokens == 3
+
+
+@pytest.mark.asyncio
+async def test_ttft_measures_the_first_token_of_any_kind():
+    # A reasoning model that thinks for 10s before its first content token has
+    # a 10s TTFT from the user's seat, not a fast one.
+    def handler(request):
+        chunks = [{"choices": [{"delta": {"reasoning_content": "think"}}]},
+                  {"choices": [{"delta": {"content": "answer"}}]}]
+        body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks)
+        return httpx.Response(200, content=(body + "data: [DONE]\n\n").encode())
+
+    async with httpx.AsyncClient(transport=transport_of(handler)) as client:
+        r = await one_request(client, cfg(), index=0)
+
+    assert r.ttft is not None
+    assert r.ttft <= r.latency
+
+
+@pytest.mark.asyncio
+async def test_role_only_opening_chunk_is_not_a_token():
+    def handler(request):
+        chunks = [{"choices": [{"delta": {"role": "assistant"}}]},
+                  {"choices": [{"delta": {"content": "a"}}]}]
+        body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks)
+        return httpx.Response(200, content=(body + "data: [DONE]\n\n").encode())
+
+    async with httpx.AsyncClient(transport=transport_of(handler)) as client:
+        r = await one_request(client, cfg(), index=0)
+
+    assert r.output_tokens == 1

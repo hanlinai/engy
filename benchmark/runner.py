@@ -101,7 +101,11 @@ async def one_request(client: httpx.AsyncClient, cfg: BenchConfig,
                     reported = usage["completion_tokens"]
 
                 for choice in chunk.get("choices") or []:
-                    if (choice.get("delta") or {}).get("content"):
+                    delta = choice.get("delta") or {}
+                    # Reasoning tokens are generated tokens: the user pays for
+                    # them and waits on them, so they count toward both TTFT
+                    # and throughput. A role-only opening chunk carries none.
+                    if delta.get("content") or delta.get("reasoning_content"):
                         if ttft is None:
                             ttft = time.monotonic() - started
                         deltas += 1
