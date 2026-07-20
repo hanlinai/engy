@@ -42,6 +42,14 @@ ENV PYTHONUNBUFFERED=1 \
     ENGY_SN53_NETUID=53 \
     ENGY_SN53_NETWORK=finney \
     ENGY_SN53_POLL_S=600 \
-    ENGY_SN53_STATE_FILE=/var/lib/engy-sn53/state.json
+    ENGY_SN53_STATE_FILE=/var/lib/engy-sn53/state.json \
+    ENGY_SN53_HEARTBEAT_FILE=/var/lib/engy-sn53/heartbeat.json
+
+# ── Liveness ────────────────────────────────────────────────────
+# The poll loop stamps the heartbeat on every cycle. This surfaces a wedged
+# loop in `docker ps`; the in-process watchdog is what actually exits so the
+# restart policy recovers it. start-period covers the first poll.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=180s --retries=3 \
+    CMD engy-sn53-health || exit 1
 
 ENTRYPOINT ["/entrypoint.sh"]

@@ -32,7 +32,8 @@ services:
         max-file: "3"
 
   watchtower:
-    image: containrrr/watchtower:latest
+    # pinned: an auto-updating updater is a second, unreviewed upgrade path
+    image: containrrr/watchtower:1.7.1
     container_name: engy_sn53_watchtower
     restart: unless-stopped
     environment:
