@@ -13,11 +13,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 chain = ["bittensor>=9.0"]
 
 [project.scripts]
 engy-sn53-validator = "validator.validator:main"
+engy-bench = "benchmark.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["validator"]
+packages = ["validator", "benchmark"]
