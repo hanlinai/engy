@@ -4,21 +4,26 @@
 
 engy serves frontier open models on consumer GPUs, with cryptographic
 verification that the model you pay for is the model that ran. Each model's
-weights and quantization are pinned by a published Merkle root — see
+weights and quantization are pinned by a published Merkle root (see
 [specs/](specs/) for the roots and how to recompute them from the public
-checkpoints. Miners commit to the model's internal activations, and auditors
-challenge a random sample: the miner opens the commitment and the opening is
-recomputed against the pinned weights. A failed opening is proof of cheating,
-not bad luck. No TEEs, no trusted hardware. The proof pins the math, not the
-machine.
+checkpoints). Every response carries a compact activation fingerprint (TOPLOC),
+the check enforced today. A sampled recompute audit, in which an auditor opens
+the miner's commitment and re-derives the challenged matrix multiplies against
+the pinned weights, is rolling out on top: a failed opening is proof of
+cheating, not bad luck. No TEEs, no trusted hardware. The proof pins the math,
+not the machine.
+
+**How it works:** the [SN53 one-pager](docs/SN53_ONE_PAGER.md) covers the
+players, the proof, scoring and emissions, and gateway routing on one page.
 
 - API and pricing: [engy.ai](https://engy.ai)
 - Subnet: netuid 53 on Bittensor
 - Company: [hanlin.ai](https://hanlin.ai)
 - Contact: ning@engy.ai
 
-Source (protocol, verifier, miner client, incentive mechanism) opens here as
-we approach open miner enrollment.
+Launching in stages: the one-pager, model specs, and the light validator below
+are public now; the audit verifier, miner client, and full incentive mechanism
+follow.
 
 ## Run a light validator
 
@@ -27,7 +32,7 @@ provider API,
 verifies the signature against the pinned master hotkey, and submits the same
 weight vector on chain. CPU-only; no GPU, no database.
 
-### With Docker (recommended — auto-updating)
+### With Docker (recommended, auto-updating)
 
 The container tracks a GHCR image and [Watchtower](https://containrrr.dev/watchtower/)
 pulls new releases automatically, so a running validator stays current without
@@ -59,10 +64,10 @@ recomputes `sha256(result_json)` and checks it equals the payload's `digest`
 (binding the signature to the exact bytes served, not just a label), verifies
 the sr25519 signature over
 `engy-sn53:epoch:v1:<netuid>:<epoch_index>:<digest>` against that recomputed
-digest, and takes the weight vector from the verified `result_json` — never
+digest, and takes the weight vector from the verified `result_json`, never
 from the top-level `weights` field, which is display metadata only. Netuid
 match and epoch freshness are also checked (only the last completed epoch is
-accepted — a replayed or stale payload is ignored and the previous weights
+accepted, so a replayed or stale payload is ignored and the previous weights
 stay in place). The raw per-miner aggregates behind every digest are public,
 so any operator can recompute a closed epoch and falsify a bad result.
 
