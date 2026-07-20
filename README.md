@@ -43,6 +43,13 @@ never re-submits an already-applied epoch.
     docker compose --env-file .env.validator -f docker/docker-compose.validator.yml up -d
     docker compose -f docker/docker-compose.validator.yml logs -f validator
 
+The poll loop stamps a heartbeat every cycle, whatever the outcome. A container
+that stops ticking for three poll intervals shows `unhealthy` in `docker ps`
+and exits, so the restart policy recovers it — check it with
+`docker inspect -f '{{.State.Health.Status}}' engy_sn53_validator`. Note that
+fetch failures and rejected payloads are *healthy*: the spec's failure posture
+is to do nothing and let the chain hold the last submitted weights.
+
 The wallet is mounted read-only from `~/.bittensor/wallets`. To build and run
 from local source instead of the published image, use
 `docker/docker-compose.validator-dev.yml` (`up --build`).

@@ -1,11 +1,15 @@
 import hashlib
 import json
+import time
 
 import httpx
+import pytest
 from substrateinterface import Keypair
 
 from validator.sync import epoch_message, MAX_RESPONSE_BYTES
-from validator.validator import tick, _last_applied
+from validator.validator import (
+    tick, _last_applied, _heartbeat_age, _watchdog_check, stall_limit, healthcheck,
+)
 
 GENESIS = 1784505600
 IDX = 12
@@ -42,7 +46,8 @@ def _cfg(tmp_path):
     return {"api": "https://engy.example", "master_hotkey": MASTER.ss58_address,
             "netuid": 53, "genesis": GENESIS, "network": "finney",
             "wallet": "w", "wallet_hotkey": "hk", "poll_s": 600,
-            "state_file": str(tmp_path / "state.json")}
+            "state_file": str(tmp_path / "state.json"),
+            "heartbeat_file": str(tmp_path / "heartbeat.json")}
 
 
 def _client(payload):
@@ -135,3 +140,92 @@ def test_last_applied_survives_corrupt_state_file(tmp_path):
     # a genuinely valid file still round-trips
     state.write_text(json.dumps({"last_applied": 7}))
     assert _last_applied(str(state)) == 7
+
+
+# ── liveness (heartbeat + watchdog) ──────────────────────────────
+
+def test_heartbeat_is_written_on_every_outcome_not_just_applied(tmp_path):
+    # The state file only moves once a week, when an epoch is applied, so it is
+    # useless as a liveness signal. The heartbeat must advance on every tick,
+    # including the ones that reject or fail.
+    cfg = _cfg(tmp_path)
+    hb = cfg["heartbeat_file"]
+
+    tick(cfg, now=NOW, client=_client(_payload()), submit_fn=lambda c, w: True)
+    assert _heartbeat_age(hb, now=NOW) == 0.0
+
+    # a rejected tick 100s later still proves the loop is alive
+    tick(cfg, now=NOW + 100, client=_client(_payload()), submit_fn=lambda c, w: True)
+    assert _heartbeat_age(hb, now=NOW + 100) == 0.0
+
+    # ...and a fetch failure too
+    dead = httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(503)))
+    tick(cfg, now=NOW + 200, client=dead, submit_fn=lambda c, w: True)
+    assert _heartbeat_age(hb, now=NOW + 200) == 0.0
+
+
+def test_heartbeat_age_grows_when_the_loop_stops_ticking(tmp_path):
+    cfg = _cfg(tmp_path)
+    tick(cfg, now=NOW, client=_client(_payload()), submit_fn=lambda c, w: True)
+    assert _heartbeat_age(cfg["heartbeat_file"], now=NOW + 3600) == 3600.0
+
+
+def test_missing_or_corrupt_heartbeat_reads_as_unknown(tmp_path):
+    assert _heartbeat_age(str(tmp_path / "nope"), now=NOW) is None
+    corrupt = tmp_path / "hb"
+    corrupt.write_text("not json")
+    assert _heartbeat_age(str(corrupt), now=NOW) is None
+
+
+def test_stall_limit_leaves_room_for_a_slow_tick(tmp_path):
+    # A tick that is merely slow (chain submit retrying) must not trip the
+    # watchdog — only a loop that has missed several polls in a row.
+    assert stall_limit(600) > 600
+    assert stall_limit(600) == 1800
+    # a very short poll interval still gets an absolute floor
+    assert stall_limit(10) == 900
+
+
+def test_watchdog_exits_only_after_the_stall_limit(tmp_path):
+    cfg = _cfg(tmp_path)
+    hb = cfg["heartbeat_file"]
+    tick(cfg, now=NOW, client=_client(_payload()), submit_fn=lambda c, w: True)
+
+    exits = []
+    # healthy: one poll interval later, well inside the limit
+    _watchdog_check(hb, poll_s=600, now=NOW + 600, exit_fn=lambda code: exits.append(code))
+    assert exits == []
+    # wedged: past the stall limit → force a non-zero exit so the container
+    # restart policy can recover it
+    _watchdog_check(hb, poll_s=600, now=NOW + 1801, exit_fn=lambda code: exits.append(code))
+    assert exits == [1]
+
+
+def test_watchdog_ignores_a_missing_heartbeat_at_startup(tmp_path):
+    # before the first tick completes there is no heartbeat; that is not a stall
+    exits = []
+    _watchdog_check(str(tmp_path / "nope"), poll_s=600, now=NOW,
+                    exit_fn=lambda code: exits.append(code))
+    assert exits == []
+
+
+def test_healthcheck_exits_nonzero_on_a_stale_heartbeat(tmp_path, monkeypatch, capsys):
+    hb = tmp_path / "heartbeat.json"
+    monkeypatch.setenv("ENGY_SN53_API", "https://engy.example")
+    monkeypatch.setenv("ENGY_SN53_MASTER_HOTKEY", MASTER.ss58_address)
+    monkeypatch.setenv("ENGY_SN53_HEARTBEAT_FILE", str(hb))
+    monkeypatch.setenv("ENGY_SN53_POLL_S", "600")
+
+    # no heartbeat yet → unhealthy
+    with pytest.raises(SystemExit) as e:
+        healthcheck()
+    assert e.value.code != 0
+
+    hb.write_text(json.dumps({"ts": time.time()}))
+    healthcheck()  # fresh → exits normally
+    assert "ok" in capsys.readouterr().out
+
+    hb.write_text(json.dumps({"ts": time.time() - 5000}))
+    with pytest.raises(SystemExit) as e:
+        healthcheck()
+    assert e.value.code != 0

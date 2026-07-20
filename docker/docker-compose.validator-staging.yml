@@ -24,7 +24,7 @@ services:
         max-file: "3"
 
   watchtower:
-    image: containrrr/watchtower:latest
+    image: containrrr/watchtower:1.7.1
     container_name: engy_sn53_watchtower_staging
     restart: unless-stopped
     environment:
