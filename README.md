@@ -27,6 +27,9 @@ follow.
 
 ## Run a light validator
 
+**Full runbook: [docs/VALIDATOR.md](docs/VALIDATOR.md)** — setup, configuration,
+what to expect, and troubleshooting. The summary below is the short version.
+
 The light validator syncs the master-signed epoch result from the engy
 provider API,
 verifies the signature against the pinned master hotkey, and submits that
