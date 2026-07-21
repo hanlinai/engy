@@ -553,6 +553,8 @@ def test_a_fully_unregistered_vector_names_its_likely_cause(tmp_path, capsys):
     # The failure a misconfigured owner_hotkey actually produces: the burn
     # target is not on chain, resolve_uids drops it, and nothing is submitted.
     # This used to be indistinguishable from a chain error in the logs.
+    # Nothing reaches the chain here only because no standby is available
+    # either — no cache, and the owner hotkey is not registered.
     cfg = _cfg(tmp_path)
     fake = FakeChain(hotkeys=["5SomeoneElse"])
     client = httpx.Client(transport=httpx.MockTransport(
@@ -561,6 +563,82 @@ def test_a_fully_unregistered_vector_names_its_likely_cause(tmp_path, capsys):
     assert fake.submitted == []
     out = capsys.readouterr().out
     assert "5Ghost" in out and "owner_hotkey" in out
+
+
+# ── standby: staying on chain when the payload lands nothing ─────
+#
+# A verified payload whose hotkeys are all unregistered used to submit nothing
+# at all, which costs consensus membership once last_update passes
+# activity_cutoff — the exact outcome the resubmit machinery exists to avoid.
+
+def test_an_unlandable_payload_falls_back_to_the_cached_vector(tmp_path):
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(hotkeys=["5Aaa"], block=BASE_BLOCK)
+    assert tick(cfg, now=NOW, client=_client(_payload()), chain=fake) == "applied"
+
+    # Same epoch, but the provider now points the whole vector at a hotkey
+    # that is not on chain. The last vector we actually landed still is.
+    fake.block = DUE_BLOCK
+    client = _client(_payload_with([["5Ghost", 65535]]))
+    out = tick(cfg, now=NOW + INTERVAL_S, client=client, chain=fake)
+    assert out == "standby:cached"
+    assert fake.submitted == [([0], [65535]), ([0], [65535])]
+
+
+def test_an_unlandable_payload_with_no_cache_burns_to_the_owner(tmp_path):
+    # Nothing has ever been landed, so there is no cache to fall back on.
+    # Burning to the owner keeps this validator inside activity_cutoff.
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(hotkeys=["5SomeoneElse", EXPECTED_OWNER_HOTKEY])
+    client = _client(_payload_with([["5Ghost", 65535]]))
+    assert tick(cfg, now=NOW, client=client, chain=fake) == "standby:burn"
+    assert fake.submitted == [([1], [65535])]
+
+
+def test_a_cache_that_no_longer_lands_falls_through_to_the_burn(tmp_path):
+    # The cached vector's miner deregistered, so the cache is as unlandable as
+    # the payload. Fall through rather than treat "we have a cache" as success.
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(hotkeys=["5Aaa"], block=BASE_BLOCK)
+    tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
+
+    fake.hotkeys = [EXPECTED_OWNER_HOTKEY]
+    fake.block = DUE_BLOCK
+    client = _client(_payload_with([["5Ghost", 65535]]))
+    out = tick(cfg, now=NOW + INTERVAL_S, client=client, chain=fake)
+    assert out == "standby:burn"
+    assert fake.submitted[-1] == ([0], [65535])
+
+
+def test_a_standby_submission_anchors_the_resubmit_interval(tmp_path):
+    # Standby is a submission like any other: it must move the rate-limit
+    # anchor, or the next poll would submit again 5 minutes later.
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(hotkeys=[EXPECTED_OWNER_HOTKEY], block=BASE_BLOCK)
+    client = _client(_payload_with([["5Ghost", 65535]]))
+    assert tick(cfg, now=NOW, client=client, chain=fake) == "standby:burn"
+
+    fake.block = BASE_BLOCK + 1
+    out = tick(cfg, now=NOW + 300, client=_client(_payload_with([["5Ghost", 65535]])),
+               chain=fake)
+    assert out == "skipped:too-soon"
+    assert len(fake.submitted) == 1
+
+
+def test_a_standby_burn_is_not_cached_as_this_epoch_s_weights(tmp_path):
+    # The burn is a liveness stopgap, not the epoch's result. Caching it would
+    # let a later provider outage resubmit the burn as if it were scored.
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(hotkeys=["5Aaa"], block=BASE_BLOCK)
+    tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
+
+    # 5Aaa deregisters, so the cache no longer lands and the burn fires.
+    fake.hotkeys = [EXPECTED_OWNER_HOTKEY]
+    fake.block = DUE_BLOCK
+    out = tick(cfg, now=NOW + INTERVAL_S,
+               client=_client(_payload_with([["5Ghost", 65535]])), chain=fake)
+    assert out == "standby:burn"
+    assert cached_weights(read_state(cfg["state_file"])) == [["5Aaa", 65535]]
 
 
 # ── configuration surface ────────────────────────────────────────

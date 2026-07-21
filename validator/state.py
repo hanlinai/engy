@@ -59,8 +59,12 @@ def cached_weights(state: dict) -> list | None:
 
 
 def write_state(path: str, *, last_applied: int, last_submit_block: int | None,
-                last_submit_ts: float, cached_weights: list) -> None:
-    """Replace the state file atomically. Call only after a successful submit."""
+                last_submit_ts: float, cached_weights: list | None) -> None:
+    """Replace the state file atomically. Call only after a successful submit.
+
+    `cached_weights` is None when the submission was a standby vector: the
+    anchor advances, but there is no scored vector worth caching.
+    """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w") as f:

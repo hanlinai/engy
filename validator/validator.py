@@ -10,6 +10,11 @@ would forfeit most of the epoch's dividends. The verified vector is therefore
 resubmitted every RESUBMIT_BLOCKS for the whole epoch, and a provider outage
 falls back to the last vector this validator actually put on chain — the same
 weights either way, but still counted as alive.
+
+The same reasoning covers a payload that verifies but lands nothing, which is
+what a provider pointing at unregistered hotkeys produces: it reaches the chain
+step and would otherwise submit an empty vector, i.e. go silent for exactly the
+reason above. `_standby_vector` degrades that to the cache, then to a burn.
 """
 from __future__ import annotations
 
@@ -22,7 +27,7 @@ import time
 import httpx
 
 from . import chain as _chain
-from .chain import EXPECTED_OWNER_HOTKEY, burn_target
+from .chain import U16, EXPECTED_OWNER_HOTKEY, burn_target
 from .schedule import BLOCK_S, RESUBMIT_BLOCKS, pregate_skip, should_submit
 from .state import (
     cached_weights, last_applied, last_submit_block, last_submit_ts,
@@ -195,6 +200,44 @@ def _resolve_weights(cfg: dict, state: dict, *, now: float,
     return cached, applied, True, None
 
 
+def _lands(chain, weights: list | None, hotkeys_on_chain: list[str]) -> bool:
+    """Whether this vector would put any non-zero weight on chain."""
+    if not weights:
+        return False
+    uids, ws = chain.resolve_uids(weights, hotkeys_on_chain)
+    return bool(uids) and sum(ws) > 0
+
+
+def _standby_vector(chain, state: dict, hotkeys_on_chain: list[str], *,
+                    from_cache: bool) -> tuple[list, str] | tuple[None, None]:
+    """What to submit when the provider's vector lands nothing, and which kind.
+
+    Submitting nothing is the one failure mode the resubmit machinery exists to
+    prevent: once last_update passes activity_cutoff the chain treats this
+    validator as inactive and drops its weights from consensus, so a provider
+    that emits unregistered hotkeys would cost us the epoch's dividends on top
+    of its own bug.
+
+    The cache comes first — it is the last vector this validator actually
+    landed, so resubmitting it keeps miners on the weights they already had.
+    Only when there is no landable cache (nothing has ever been submitted, or
+    its miners have since deregistered) do we burn, which changes the
+    distribution and is therefore the last resort rather than the first.
+    """
+    if not from_cache:  # already tried, and it is what got us here
+        cached = cached_weights(state)
+        if _lands(chain, cached, hotkeys_on_chain):
+            print(f"[chain] standby: resubmitting the last vector this "
+                  f"validator landed ({len(cached)} hotkeys)", flush=True)
+            return cached, "standby:cached"
+    if EXPECTED_OWNER_HOTKEY in hotkeys_on_chain:
+        print(f"[chain] standby: no landable cache — burning to "
+              f"{EXPECTED_OWNER_HOTKEY} to stay inside activity_cutoff",
+              flush=True)
+        return [[EXPECTED_OWNER_HOTKEY, U16]], "standby:burn"
+    return None, None
+
+
 def _run_tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
               chain=None) -> str:
     chain = chain or _chain
@@ -254,6 +297,7 @@ def _run_tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
               f"holding {share:.1%} of weight — dropped: {', '.join(dropped)}",
               flush=True)
 
+    standby = None
     uids, ws = chain.resolve_uids(weights, view.hotkeys)
     if not uids or sum(ws) == 0:
         # Distinct from a chain error: the payload is fine, but none of it
@@ -261,10 +305,15 @@ def _run_tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
         # like, so name that rather than leave a generic failure in the log.
         who = target or ", ".join(hk for hk, _ in weights[:5])
         print(f"[chain] none of the payload's hotkeys are registered on chain "
-              f"({who}) — submitting nothing, keeping last weights. For a burn "
-              f"this usually means the provider's owner_hotkey is wrong.",
-              flush=True)
-        return "submit-failed"
+              f"({who}). For a burn this usually means the provider's "
+              f"owner_hotkey is wrong.", flush=True)
+        fallback, standby = _standby_vector(chain, state, view.hotkeys,
+                                            from_cache=from_cache)
+        if fallback is None:
+            print("[chain] no standby vector available — submitting nothing, "
+                  "keeping last weights", flush=True)
+            return "submit-failed"
+        uids, ws = chain.resolve_uids(fallback, view.hotkeys)
 
     if not chain.set_weights(view, wallet=cfg["wallet"],
                              wallet_hotkey=cfg["wallet_hotkey"],
@@ -273,13 +322,22 @@ def _run_tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
 
     # Only now, and all four together: a partial advance would make the next
     # tick believe it had already submitted.
+    #
+    # A standby submission advances only the anchor. It marks the epoch seen so
+    # the resubmit interval gates the next attempt, but leaves cached_weights
+    # alone: the standby vector is a liveness stopgap, not this epoch's result,
+    # and caching it would let a later provider outage resubmit it as if it had
+    # been scored.
     write_state(cfg["state_file"], last_applied=epoch, last_submit_block=view.block,
-                last_submit_ts=now, cached_weights=weights)
+                last_submit_ts=now,
+                cached_weights=cached_weights(state) if standby else weights)
 
     gap = ("?" if view.block is None or previous_block is None
            else view.block - previous_block)
     print(f"[sync] epoch {epoch}: submitted {len(uids)} uids "
           f"({gap} blocks since last submit)", flush=True)
+    if standby:
+        return standby
     if from_cache:
         return "resubmitted:cached"
     return "applied" if is_new_epoch else "resubmitted"
