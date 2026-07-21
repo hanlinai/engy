@@ -109,7 +109,7 @@ def fetch_weights(api_base: str, timeout: float = 30.0, client: httpx.Client | N
     own = client is None
     client = client or httpx.Client(timeout=timeout)
     try:
-        url = f"{api_base.rstrip('/')}/api/subnet/v1/weights/latest"
+        url = f"{api_base.rstrip('/')}/api/subnet/v1/epoch/latest"
         with client.stream("GET", url) as resp:
             resp.raise_for_status()
             cl = resp.headers.get("content-length")

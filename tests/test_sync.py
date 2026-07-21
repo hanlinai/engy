@@ -161,7 +161,7 @@ def test_fetch_weights_hits_the_v1_route():
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     p = fetch_weights("https://engy.example", client=client)
-    assert seen["url"] == "https://engy.example/api/subnet/v1/weights/latest"
+    assert seen["url"] == "https://engy.example/api/subnet/v1/epoch/latest"
     assert p["epoch_index"] == IDX
 
 
