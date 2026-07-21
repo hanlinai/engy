@@ -28,6 +28,12 @@ services:
     container_name: engy_sn53_watchtower_staging
     restart: unless-stopped
     environment:
+      # Docker 25+ refuses API versions below 1.40, and watchtower 1.7.1 —
+      # the newest release; upstream has been dormant since 2023-11 — speaks
+      # 1.25 and crash-loops on `client version 1.25 is too old`. Forcing the
+      # negotiated version is the whole fix. Without it auto-updates silently
+      # do not happen, which is how a validator stays on a broken image.
+      - DOCKER_API_VERSION=1.44
       - WATCHTOWER_LABEL_ENABLE=true
       - WATCHTOWER_POLL_INTERVAL=120
       - WATCHTOWER_CLEANUP=true
