@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "engy-sn53"
-version = "0.3.0"
+version = "0.3.1"
 description = "engy Bittensor subnet 53 — light validator (and, later, the open miner)"
 requires-python = ">=3.11"
 # Upper bounds are deliberate. Validators auto-update from `:latest` within

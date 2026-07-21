@@ -615,3 +615,58 @@ def test_the_protocol_defaults_stay_overridable_for_staging(monkeypatch):
     cfg = load_config()
     assert cfg["api"] == "https://provider.teby.ai"
     assert cfg["master_hotkey"] == "5Staging"
+
+
+# ── operator-visible liveness ────────────────────────────────────
+
+def _outcomes_with_output(tmp_path, capsys):
+    """Every tick outcome, paired with whether it printed anything."""
+    seen = {}
+
+    def run(label, cfg, **kw):
+        capsys.readouterr()                       # drop prior output
+        out = tick(cfg, **kw)
+        seen[out] = capsys.readouterr().out.strip()
+        return out
+
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(block=BASE_BLOCK)
+    run("applied", cfg, now=NOW, client=_client(_payload()), chain=fake)
+    run("pregate", cfg, now=NOW + 60, client=_client(_payload()), chain=fake)
+    fake.block = DUE_BLOCK - 1
+    run("blockskip", cfg, now=NOW + INTERVAL_S, client=_client(_payload()), chain=fake)
+    fake.block = DUE_BLOCK
+    run("resubmit", cfg, now=NOW + INTERVAL_S, client=_client(_payload()), chain=fake)
+    fake.block = DUE_BLOCK + RESUBMIT_BLOCKS
+    run("cached", cfg, now=NOW + 2 * INTERVAL_S, client=_dead_client(), chain=fake)
+    run("fetchfail", _cfg(tmp_path / "b"), now=NOW, client=_dead_client(), chain=FakeChain())
+    run("chainfail", _cfg(tmp_path / "c"), now=NOW, client=_client(_payload()),
+        chain=FakeChain(open_raises=True))
+    run("submitfail", _cfg(tmp_path / "d"), now=NOW, client=_client(_payload()),
+        chain=FakeChain(ok=False))
+    return seen
+
+
+def test_every_tick_outcome_says_something(tmp_path, capsys):
+    # A validator operator's only continuous signal is the log. With a 300s
+    # poll and a ~24min resubmit interval, four ticks in five legitimately
+    # skip — so if skipping is silent, a healthy validator and a wedged one
+    # look identical to anyone tailing the logs.
+    seen = _outcomes_with_output(tmp_path, capsys)
+    silent = sorted(k for k, v in seen.items() if not v)
+    assert silent == [], f"these outcomes print nothing: {silent}"
+
+
+def test_a_skipped_tick_says_when_it_will_act(tmp_path, capsys):
+    # "Alive" is not enough on its own; the line should also show the loop
+    # knows what it is waiting for.
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(block=BASE_BLOCK)
+    tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
+
+    capsys.readouterr()
+    fake.block = DUE_BLOCK - 20
+    assert tick(cfg, now=NOW + INTERVAL_S, client=_client(_payload()),
+                chain=fake) == "skipped:too-soon"
+    out = capsys.readouterr().out
+    assert str(IDX) in out and "20" in out    # epoch, and blocks still to wait

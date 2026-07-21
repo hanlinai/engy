@@ -23,7 +23,7 @@ import httpx
 
 from . import chain as _chain
 from .chain import EXPECTED_OWNER_HOTKEY, burn_target
-from .schedule import RESUBMIT_BLOCKS, pregate_skip, should_submit
+from .schedule import BLOCK_S, RESUBMIT_BLOCKS, pregate_skip, should_submit
 from .state import (
     cached_weights, last_applied, last_submit_block, last_submit_ts,
     read_state, write_state,
@@ -210,6 +210,13 @@ def _run_tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
     interval = cfg.get("resubmit_blocks", RESUBMIT_BLOCKS)
     if not is_new_epoch and pregate_skip(now=now, last_submit_ts=last_submit_ts(state),
                                          interval_blocks=interval):
+        # Most ticks land here. Say so: with a 300s poll and a ~24min interval,
+        # four ticks in five legitimately skip, and a silent skip makes a
+        # healthy validator indistinguishable from a wedged one in the log.
+        due_in = interval * BLOCK_S - (now - (last_submit_ts(state) or now))
+        print(f"[tick] epoch {epoch} already submitted; next resubmit in "
+              f"~{max(0, due_in) / 60:.0f} min (not contacting the chain yet)",
+              flush=True)
         return "skipped:too-soon"
 
     try:
@@ -226,6 +233,12 @@ def _run_tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
                          current_block=view.block, last_submit_block=previous_block,
                          now=now, last_submit_ts=last_submit_ts(state),
                          interval_blocks=interval):
+        waited = (view.block - previous_block
+                  if view.block is not None and previous_block is not None else None)
+        detail = (f"{interval - waited} more blocks" if waited is not None
+                  else "waiting on the wall clock (block number unavailable)")
+        print(f"[tick] epoch {epoch} already submitted at block {previous_block}; "
+              f"resubmit in {detail}", flush=True)
         return "skipped:too-soon"
 
     target = burn_target(weights)
