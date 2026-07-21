@@ -77,10 +77,16 @@ the sr25519 signature over
 `engy-sn53:epoch:v1:<netuid>:<epoch_index>:<digest>` against that recomputed
 digest, and takes the weight vector from the verified `result_json`, never
 from the top-level `weights` field, which is display metadata only. Netuid
-match and epoch freshness are also checked (only the last completed epoch is
-accepted, so a replayed or stale payload is ignored and the previous weights
-stay in place). The raw per-miner aggregates behind every digest are public,
-so any operator can recompute a closed epoch and falsify a bad result.
+and weight well-formedness are checked too. The raw per-miner aggregates
+behind every digest are public, so any operator can recompute a closed epoch
+and falsify a bad result.
+
+The validator is deliberately not epoch-aware: it never computes which epoch
+is current, and pins no `epoch_s` or `genesis_ts` locally. The provider owns
+the timeline. A replayed old payload is stopped instead by a monotonic guard —
+an epoch older than the one already applied is never submitted — which is a
+local state comparison requiring no clock and nothing the provider can
+influence.
 
 ## Dev setup
 

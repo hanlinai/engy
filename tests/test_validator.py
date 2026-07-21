@@ -65,9 +65,24 @@ def _payload_with(weights):
             "signed_at": END + 610}
 
 
+def _payload_with_epoch(idx, weights):
+    """A genuinely master-signed payload for an arbitrary epoch index."""
+    rj = json.dumps({"epoch_end": END, "epoch_index": idx,
+                     "epoch_start": END - 604800, "miners": [], "netuid": 53,
+                     "params": {}, "v": 1, "weights": weights},
+                    sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(rj.encode("utf-8")).hexdigest()
+    return {"v": 1, "netuid": 53, "epoch_index": idx,
+            "epoch_start": END - 604800, "epoch_end": END, "digest": digest,
+            "result_json": rj, "weights": weights,
+            "signed_hotkey": MASTER.ss58_address,
+            "signature": MASTER.sign(epoch_message(53, idx, digest).encode()).hex(),
+            "signed_at": END + 610}
+
+
 def _cfg(tmp_path):
     return {"api": "https://engy.example", "master_hotkey": MASTER.ss58_address,
-            "netuid": 53, "genesis": GENESIS, "network": "finney",
+            "netuid": 53, "network": "finney",
             "wallet": "w", "wallet_hotkey": "hk", "poll_s": 300,
             "state_file": str(tmp_path / "state.json"),
             "heartbeat_file": str(tmp_path / "heartbeat.json")}
@@ -381,18 +396,39 @@ def test_the_cache_still_respects_the_resubmit_interval(tmp_path):
     assert len(fake.submitted) == 1
 
 
-def test_a_stale_epoch_during_rollover_falls_back_to_the_cache(tmp_path):
-    # After a new epoch opens but before the provider publishes it, the served
-    # payload is rejected as stale. Keep submitting instead of going silent.
+def test_epoch_rollover_is_no_longer_a_special_window(tmp_path):
+    # This used to be a hazard: after a new epoch opened but before the
+    # provider published it, the served payload was rejected as stale and the
+    # validator went silent. With no epoch awareness there is no rollover
+    # window at all — the same payload simply resubmits on schedule, however
+    # much wall-clock time has passed.
     cfg = _cfg(tmp_path)
     fake = FakeChain(block=BASE_BLOCK)
     tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
 
     fake.block = DUE_BLOCK
-    rolled = NOW + 604800          # one epoch later; IDX is now two epochs old
-    out = tick(cfg, now=rolled, client=_client(_payload()), chain=fake)
-    assert out == "resubmitted:cached"
+    much_later = NOW + 30 * 86400
+    assert tick(cfg, now=much_later, client=_client(_payload()),
+                chain=fake) == "resubmitted"
     assert len(fake.submitted) == 2
+
+
+def test_a_replayed_older_epoch_never_reaches_the_chain(tmp_path):
+    # Verification no longer applies any freshness test, so the monotonic
+    # guard is the only thing standing between a genuinely-signed old payload
+    # and the chain. Nothing here consults a clock or a notion of "current
+    # epoch" — only what this validator has already applied.
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(block=BASE_BLOCK)
+    tick(cfg, now=NOW, client=_client(_payload()), chain=fake)      # applies IDX
+    assert len(fake.submitted) == 1
+
+    older = _payload_with_epoch(IDX - 1, [["5Evil", 65535]])
+    fake.block = DUE_BLOCK
+    out = tick(cfg, now=NOW + INTERVAL_S, client=_client(older), chain=fake)
+    assert out == "skipped:too-soon"
+    assert len(fake.submitted) == 1                                # nothing new
+    assert last_applied(read_state(cfg["state_file"])) == IDX      # unmoved
 
 
 def test_no_cache_and_no_payload_submits_nothing(tmp_path):

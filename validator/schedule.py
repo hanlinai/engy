@@ -47,7 +47,13 @@ def should_submit(*, epoch_index: int, last_applied: int | None,
     if last_applied is None or epoch_index > last_applied:
         return True
     if epoch_index < last_applied:
-        return False       # defensive; freshness already rejects stale epochs
+        # Load-bearing, not defensive. The validator is not epoch-aware and
+        # verification applies no freshness test, so this monotonic guard is
+        # what stops a genuinely-signed old payload from being replayed onto
+        # the chain — the residual attack when the serving infrastructure is
+        # compromised but the master key is not. Local state only; no clock,
+        # no notion of "current epoch", nothing the provider can influence.
+        return False
     if current_block is None or last_submit_block is None:
         return _clock_says_due(now=now, last_submit_ts=last_submit_ts,
                                interval_blocks=interval_blocks)

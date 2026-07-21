@@ -4,7 +4,7 @@ import json
 import httpx
 from substrateinterface import Keypair
 
-from validator.sync import epoch_index, epoch_message, verify_payload, fetch_weights
+from validator.sync import epoch_message, verify_payload, fetch_weights
 
 GENESIS = 1784505600
 NETUID = 53
@@ -45,14 +45,12 @@ def payload(*, result_json=None, digest=None, signature=None, **over):
 
 
 def verify(p, **over):
-    kw = dict(master_hotkey=MASTER.ss58_address, netuid=NETUID,
-              genesis=GENESIS, now=NOW)
+    kw = dict(master_hotkey=MASTER.ss58_address, netuid=NETUID)
     kw.update(over)
     return verify_payload(p, **kw)
 
 
-def test_epoch_math_matches_spec_example():
-    assert epoch_index(START, GENESIS) == 12
+def test_signed_message_format_matches_the_cross_repo_contract():
     assert epoch_message(53, 12, "d3ad") == "engy-sn53:epoch:v1:53:12:d3ad"
 
 
@@ -128,14 +126,22 @@ def test_rejects_wrong_netuid_and_version():
     assert verify(payload(v=2))[1] == "version"
 
 
-def test_rejects_stale_epoch():
-    # a replayed epoch-11 payload while epoch 13 is running
+def test_an_old_payload_still_verifies_replay_is_stopped_by_monotonicity():
+    # No epoch math here any more: the provider owns the timeline, and a
+    # genuinely-signed old payload is genuinely signed. Verification says so.
+    # Refusing to *submit* it is should_submit's job (epoch_index < last_applied),
+    # which is a local state comparison needing no notion of "current epoch".
     old = 11
     rj = _result_json(epoch_index=old, epoch_start=START - 604800, epoch_end=START)
     digest = hashlib.sha256(rj.encode("utf-8")).hexdigest()
     p = payload(epoch_index=old, result_json=rj, digest=digest,
                 signature=MASTER.sign(epoch_message(NETUID, old, digest).encode()).hex())
-    assert verify(p) == (False, "stale-epoch", None, None)
+    ok, reason, weights, idx = verify(p)
+    assert (ok, reason, idx) == (True, "ok", old)
+
+    from validator.schedule import should_submit
+    assert should_submit(epoch_index=old, last_applied=12, current_block=9999,
+                         last_submit_block=0, now=NOW, last_submit_ts=None) is False
 
 
 def test_rejects_malformed_signature_non_hex():
@@ -162,8 +168,7 @@ def test_fetch_weights_hits_the_v1_route():
 def test_non_dict_payload_is_malformed():
     for bad in ([1, 2, 3], "nope", 5, None):
         ok, reason, weights, idx = verify_payload(
-            bad, master_hotkey=MASTER.ss58_address, netuid=NETUID,
-            genesis=GENESIS, now=NOW)
+            bad, master_hotkey=MASTER.ss58_address, netuid=NETUID)
         assert ok is False and reason == "malformed" and weights is None and idx is None
 
 
@@ -229,10 +234,28 @@ def test_accepts_well_formed_weights():
     assert weights == [["5Aaa", 0], ["5Bbb", 65535]] and idx == IDX
 
 
-def test_verify_payload_no_longer_takes_last_applied():
-    # Scheduling moved out of verification: an epoch already on chain still
-    # verifies, because deciding whether to resubmit is the tick's job now.
+def test_verify_payload_takes_no_scheduling_or_timing_arguments():
+    # The validator is not epoch-aware: it neither schedules from verification
+    # nor computes which epoch it is in. It fetches, checks the signature, and
+    # submits. Everything the provider owns stays with the provider.
     import inspect
-    assert "last_applied" not in inspect.signature(verify_payload).parameters
+    params = inspect.signature(verify_payload).parameters
+    for gone in ("last_applied", "now", "genesis"):
+        assert gone not in params, gone
     ok, _, _, idx = verify(payload())
     assert ok and idx == IDX
+
+
+def test_epoch_length_and_genesis_are_no_longer_pinned_locally():
+    # These constants had to match the provider's timeline exactly. They did
+    # not (code said 604800 while prod ran 86400 and staging 3600), so every
+    # payload was silently rejected as stale. There is nothing left to drift.
+    import validator.sync as sync
+    assert not hasattr(sync, "EPOCH_S")
+    assert not hasattr(sync, "epoch_index")
+
+
+def test_a_payload_from_any_point_in_time_verifies():
+    # No wall-clock input at all: the same payload must verify identically
+    # whenever it is checked.
+    assert verify(payload())[0] is True
