@@ -1,5 +1,6 @@
 from validator.chain import (
-    ChainView, dropped_weight_share, resolve_uids, skipped_hotkeys, _valid_block,
+    EXPECTED_OWNER_HOTKEY, ChainView, burn_target, dropped_weight_share,
+    resolve_uids, skipped_hotkeys, _valid_block,
 )
 
 
@@ -72,3 +73,30 @@ def test_only_positive_ints_count_as_a_block_number():
     assert _valid_block(4823910) == 4823910
     for bad in (None, 0, -1, True, False, 1.5, "4823910"):
         assert _valid_block(bad) is None, bad
+
+
+# ── burn target ──────────────────────────────────────────────────
+
+def test_burn_target_names_the_sole_recipient():
+    assert burn_target([["5Owner", 65535]]) == "5Owner"
+
+
+def test_burn_target_ignores_zero_weight_rows():
+    # A vector can carry scored-but-zero miners alongside the burn.
+    assert burn_target([["5A", 0], ["5Owner", 65535], ["5B", 0]]) == "5Owner"
+
+
+def test_burn_target_is_none_for_a_real_distribution():
+    assert burn_target([["5A", 40000], ["5B", 25535]]) is None
+
+
+def test_burn_target_is_none_for_an_empty_or_all_zero_vector():
+    assert burn_target([]) is None
+    assert burn_target([["5A", 0], ["5B", 0]]) is None
+
+
+def test_the_expected_owner_is_the_registered_subnet_owner():
+    # Pinned from the chain: SubnetOwnerHotkey for netuid 53, registered at
+    # uid 161. A burn to an unregistered hotkey resolves to no uid at all, so
+    # nothing is submitted and the validator silently sets no weights.
+    assert EXPECTED_OWNER_HOTKEY == "5F2HTUqtk9VWQwXkkUX9oFSXUkAib74qw7s3W7KyZP88AmYe"

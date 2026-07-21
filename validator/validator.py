@@ -22,6 +22,7 @@ import time
 import httpx
 
 from . import chain as _chain
+from .chain import EXPECTED_OWNER_HOTKEY, burn_target
 from .schedule import RESUBMIT_BLOCKS, pregate_skip, should_submit
 from .state import (
     cached_weights, last_applied, last_submit_block, last_submit_ts,
@@ -214,6 +215,12 @@ def _run_tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
                          interval_blocks=interval):
         return "skipped:too-soon"
 
+    target = burn_target(weights)
+    if target is not None and target != EXPECTED_OWNER_HOTKEY:
+        print(f"[chain] burn goes to {target}, expected owner "
+              f"{EXPECTED_OWNER_HOTKEY} — submitting anyway; check the "
+              f"provider's owner_hotkey", flush=True)
+
     dropped = chain.skipped_hotkeys(weights, view.hotkeys)
     if dropped:
         share = chain.dropped_weight_share(weights, view.hotkeys)
@@ -223,7 +230,13 @@ def _run_tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
 
     uids, ws = chain.resolve_uids(weights, view.hotkeys)
     if not uids or sum(ws) == 0:
-        print("[chain] no payload hotkey is registered on chain; keeping last weights",
+        # Distinct from a chain error: the payload is fine, but none of it
+        # lands. For a burn this is what a wrong provider owner_hotkey looks
+        # like, so name that rather than leave a generic failure in the log.
+        who = target or ", ".join(hk for hk, _ in weights[:5])
+        print(f"[chain] none of the payload's hotkeys are registered on chain "
+              f"({who}) — submitting nothing, keeping last weights. For a burn "
+              f"this usually means the provider's owner_hotkey is wrong.",
               flush=True)
         return "submit-failed"
 
