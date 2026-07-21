@@ -1,9 +1,22 @@
 """Fetch and verify the master-signed weight payload (spec §8, §10).
 
-Trust model: the ONLY root of trust is the master hotkey pinned in local
-config. The payload's own `signed_hotkey` field is display metadata — never
-verify against it. Replay protection: the epoch index is inside the signed
-message, and only `current_epoch − 1` (the last completed epoch) is accepted.
+Trust model: the provider owns scoring and the epoch timeline; this validator
+trusts its data and checks only that it genuinely came from the master hotkey
+pinned in local config. The payload's own `signed_hotkey` field is display
+metadata — never verify against it.
+
+The validator is deliberately NOT epoch-aware. It does not know or compute
+which epoch is current; it fetches on an interval, verifies, and submits.
+Pinning `epoch_s` and `genesis_ts` locally meant they had to match the
+provider exactly, and when they drifted (code said 604800 while prod ran 86400
+and staging 3600) every payload was silently rejected as stale — a total
+outage with no error, no exit and a healthy heartbeat. There is now nothing
+left to keep in sync.
+
+Replay is bounded by `should_submit`'s monotonic guard (never accept an epoch
+older than the one already applied), a local state comparison that needs no
+notion of "current epoch". That covers the case where the serving
+infrastructure is compromised but the master key is not.
 
 Binding: the master signs `sha256(result_json)`, not the top-level `weights`
 field. The weight vector actually submitted MUST be extracted from the
@@ -17,12 +30,7 @@ import json
 
 import httpx
 
-EPOCH_S = 604800
 MAX_RESPONSE_BYTES = 1024 * 1024  # 1 MiB cap on the weights payload
-
-
-def epoch_index(ts: float, genesis: int) -> int:
-    return int((ts - genesis) // EPOCH_S)
 
 
 def epoch_message(netuid: int, epoch_index: int, digest_hex: str) -> str:
@@ -36,8 +44,8 @@ def well_formed_weights(w) -> bool:
                 and 0 <= p[1] <= 65535 for p in w))
 
 
-def verify_payload(payload: dict, *, master_hotkey: str, netuid: int, genesis: int,
-                   now: float) -> tuple[bool, str, list | None, int | None]:
+def verify_payload(payload: dict, *, master_hotkey: str,
+                   netuid: int) -> tuple[bool, str, list | None, int | None]:
     """Verify a fetched payload and return (ok, reason, weights, epoch_index).
 
     `weights` (only set when ok) is the weight vector extracted from the
@@ -45,11 +53,11 @@ def verify_payload(payload: dict, *, master_hotkey: str, netuid: int, genesis: i
     field, which is display metadata a compromised coordination layer could
     forge independently of the signature.
 
-    Scheduling is NOT decided here. Whether an already-applied epoch should be
-    resubmitted is the tick's decision (validator/schedule.py); this function
-    answers only "is this payload genuine and fresh?". Replay protection is
-    unaffected: the epoch is pinned to exactly `current - 1` below, so an older
-    epoch is rejected as stale before anything else can look at it.
+    Neither scheduling nor timing is decided here. This function answers one
+    question — "did the master sign these exact bytes?" — and takes no clock
+    or epoch input at all, so the same payload verifies identically whenever
+    it is checked. When to submit, and refusing to go backwards, both belong
+    to validator/schedule.py.
     """
     if not isinstance(payload, dict):
         return False, "malformed", None, None
@@ -93,9 +101,6 @@ def verify_payload(payload: dict, *, master_hotkey: str, netuid: int, genesis: i
             or not well_formed_weights(result.get("weights"))):
         return False, "malformed", None, None
     weights = result["weights"]
-
-    if idx != epoch_index(now, genesis) - 1:
-        return False, "stale-epoch", None, None
 
     return True, "ok", weights, idx
 

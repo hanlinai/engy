@@ -41,7 +41,6 @@ def load_config() -> dict:
         "api": env["ENGY_SN53_API"],
         "master_hotkey": env["ENGY_SN53_MASTER_HOTKEY"],
         "netuid": int(env.get("ENGY_SN53_NETUID", "53")),
-        "genesis": int(env.get("ENGY_SN53_GENESIS_TS", "1784505600")),
         "network": env.get("ENGY_SN53_NETWORK", "finney"),
         "wallet": env.get("ENGY_SN53_WALLET", "default"),
         "wallet_hotkey": env.get("ENGY_SN53_WALLET_HOTKEY", "default"),
@@ -167,8 +166,7 @@ def _resolve_weights(cfg: dict, state: dict, *, now: float,
         print(f"[sync] fetch failed: {e}", flush=True)
     else:
         ok, reason, weights, idx = verify_payload(
-            payload, master_hotkey=cfg["master_hotkey"], netuid=cfg["netuid"],
-            genesis=cfg["genesis"], now=now)
+            payload, master_hotkey=cfg["master_hotkey"], netuid=cfg["netuid"])
         if ok:
             return weights, idx, False, None
         print(f"[sync] payload rejected: {reason}", flush=True)
