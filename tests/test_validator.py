@@ -10,6 +10,7 @@ from validator import chain as chain_mod
 from validator.state import (
     read_state, last_applied, last_submit_block, cached_weights,
 )
+from validator.schedule import BLOCK_S, RESUBMIT_BLOCKS
 from validator.sync import epoch_message, MAX_RESPONSE_BYTES
 from validator.validator import (
     tick, _heartbeat_age, _watchdog_check, stall_limit, healthcheck,
@@ -20,6 +21,9 @@ IDX = 12
 END = GENESIS + 13 * 604800
 NOW = float(END + 3600)
 MASTER = Keypair.create_from_uri("//Alice")
+BASE_BLOCK = 5000
+DUE_BLOCK = BASE_BLOCK + RESUBMIT_BLOCKS          # first block a resubmit is due
+INTERVAL_S = RESUBMIT_BLOCKS * BLOCK_S            # wall-clock fallback interval
 
 
 def _result_json(**over):
@@ -72,7 +76,7 @@ def _cfg(tmp_path):
 class FakeChain:
     """Stands in for validator.chain, recording what reached the chain."""
 
-    def __init__(self, hotkeys=("5Aaa",), block=5000, ok=True, open_raises=False):
+    def __init__(self, hotkeys=("5Aaa",), block=BASE_BLOCK, ok=True, open_raises=False):
         self.hotkeys = list(hotkeys)
         self.block = block
         self.ok = ok
@@ -110,42 +114,42 @@ def _dead_client():
 
 def test_new_epoch_applies_and_records_every_state_field(tmp_path):
     cfg = _cfg(tmp_path)
-    fake = FakeChain(block=5000)
+    fake = FakeChain(block=BASE_BLOCK)
     assert tick(cfg, now=NOW, client=_client(_payload()), chain=fake) == "applied"
     assert fake.submitted == [([0], [65535])]
     s = read_state(cfg["state_file"])
     assert last_applied(s) == IDX
-    assert last_submit_block(s) == 5000
+    assert last_submit_block(s) == BASE_BLOCK
     assert cached_weights(s) == [["5Aaa", 65535]]
 
 
 def test_same_epoch_holds_until_the_resubmit_interval(tmp_path):
     cfg = _cfg(tmp_path)
-    fake = FakeChain(block=5000)
+    fake = FakeChain(block=BASE_BLOCK)
     tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
-    # 99 blocks later, past the pre-gate but short of the interval
-    fake.block = 5099
-    out = tick(cfg, now=NOW + 1000, client=_client(_payload()), chain=fake)
+    # one block short of the interval, past the pre-gate
+    fake.block = DUE_BLOCK - 1
+    out = tick(cfg, now=NOW + INTERVAL_S, client=_client(_payload()), chain=fake)
     assert out == "skipped:too-soon"
     assert len(fake.submitted) == 1
 
 
-def test_same_epoch_resubmits_at_100_blocks(tmp_path):
+def test_same_epoch_resubmits_once_the_interval_has_passed(tmp_path):
     cfg = _cfg(tmp_path)
-    fake = FakeChain(block=5000)
+    fake = FakeChain(block=BASE_BLOCK)
     tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
-    fake.block = 5100
-    out = tick(cfg, now=NOW + 1200, client=_client(_payload()), chain=fake)
+    fake.block = DUE_BLOCK
+    out = tick(cfg, now=NOW + INTERVAL_S, client=_client(_payload()), chain=fake)
     assert out == "resubmitted"
     assert fake.submitted == [([0], [65535]), ([0], [65535])]
     s = read_state(cfg["state_file"])
-    assert last_submit_block(s) == 5100      # advances
+    assert last_submit_block(s) == DUE_BLOCK  # advances
     assert last_applied(s) == IDX            # unchanged — same epoch
 
 
 def test_the_pregate_avoids_opening_a_connection_when_clearly_too_early(tmp_path):
     cfg = _cfg(tmp_path)
-    fake = FakeChain(block=5000)
+    fake = FakeChain(block=BASE_BLOCK)
     tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
     assert fake.opens == 1
     out = tick(cfg, now=NOW + 300, client=_client(_payload()), chain=fake)
@@ -158,10 +162,10 @@ def test_a_missing_block_number_falls_back_to_the_wall_clock(tmp_path):
     fake = FakeChain(block=None)
     assert tick(cfg, now=NOW, client=_client(_payload()), chain=fake) == "applied"
     assert last_submit_block(read_state(cfg["state_file"])) is None
-    # 1199s later: still short of the 1200s fallback interval
-    assert tick(cfg, now=NOW + 1199, client=_client(_payload()),
+    # one second short of the fallback interval
+    assert tick(cfg, now=NOW + INTERVAL_S - 1, client=_client(_payload()),
                 chain=fake) == "skipped:too-soon"
-    assert tick(cfg, now=NOW + 1200, client=_client(_payload()),
+    assert tick(cfg, now=NOW + INTERVAL_S, client=_client(_payload()),
                 chain=fake) == "resubmitted"
 
 
@@ -183,17 +187,17 @@ def test_submit_failure_advances_no_state_field(tmp_path):
 
 def test_a_failed_resubmit_retries_on_the_next_poll_not_a_full_interval_later(tmp_path):
     cfg = _cfg(tmp_path)
-    fake = FakeChain(block=5000)
+    fake = FakeChain(block=BASE_BLOCK)
     tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
 
-    fake.block, fake.ok = 5100, False
-    assert tick(cfg, now=NOW + 1200, client=_client(_payload()),
+    fake.block, fake.ok = DUE_BLOCK, False
+    assert tick(cfg, now=NOW + INTERVAL_S, client=_client(_payload()),
                 chain=fake) == "submit-failed"
-    assert last_submit_block(read_state(cfg["state_file"])) == 5000  # not advanced
+    assert last_submit_block(read_state(cfg["state_file"])) == BASE_BLOCK  # not advanced
 
     # one poll later (300s, 25 blocks) the retry goes through
-    fake.block, fake.ok = 5125, True
-    assert tick(cfg, now=NOW + 1500, client=_client(_payload()),
+    fake.block, fake.ok = DUE_BLOCK + 25, True
+    assert tick(cfg, now=NOW + INTERVAL_S + 300, client=_client(_payload()),
                 chain=fake) == "resubmitted"
 
 
@@ -357,22 +361,22 @@ def test_a_provider_outage_keeps_resubmitting_the_cached_vector(tmp_path):
     # Without this the validator goes silent through the outage and passes
     # activity_cutoff, dropping out of consensus for the rest of the epoch.
     cfg = _cfg(tmp_path)
-    fake = FakeChain(block=5000)
+    fake = FakeChain(block=BASE_BLOCK)
     tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
 
-    fake.block = 5100
-    out = tick(cfg, now=NOW + 1200, client=_dead_client(), chain=fake)
+    fake.block = DUE_BLOCK
+    out = tick(cfg, now=NOW + INTERVAL_S, client=_dead_client(), chain=fake)
     assert out == "resubmitted:cached"
     assert fake.submitted == [([0], [65535]), ([0], [65535])]
-    assert last_submit_block(read_state(cfg["state_file"])) == 5100
+    assert last_submit_block(read_state(cfg["state_file"])) == DUE_BLOCK
 
 
 def test_the_cache_still_respects_the_resubmit_interval(tmp_path):
     cfg = _cfg(tmp_path)
-    fake = FakeChain(block=5000)
+    fake = FakeChain(block=BASE_BLOCK)
     tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
-    fake.block = 5050
-    assert tick(cfg, now=NOW + 1000, client=_dead_client(),
+    fake.block = DUE_BLOCK - 1
+    assert tick(cfg, now=NOW + INTERVAL_S, client=_dead_client(),
                 chain=fake) == "skipped:too-soon"
     assert len(fake.submitted) == 1
 
@@ -381,10 +385,10 @@ def test_a_stale_epoch_during_rollover_falls_back_to_the_cache(tmp_path):
     # After a new epoch opens but before the provider publishes it, the served
     # payload is rejected as stale. Keep submitting instead of going silent.
     cfg = _cfg(tmp_path)
-    fake = FakeChain(block=5000)
+    fake = FakeChain(block=BASE_BLOCK)
     tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
 
-    fake.block = 5100
+    fake.block = DUE_BLOCK
     rolled = NOW + 604800          # one epoch later; IDX is now two epochs old
     out = tick(cfg, now=rolled, client=_client(_payload()), chain=fake)
     assert out == "resubmitted:cached"
@@ -400,10 +404,10 @@ def test_no_cache_and_no_payload_submits_nothing(tmp_path):
 
 def test_a_recovered_provider_takes_over_from_the_cache(tmp_path):
     cfg = _cfg(tmp_path)
-    fake = FakeChain(block=5000)
+    fake = FakeChain(block=BASE_BLOCK)
     tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
-    fake.block = 5100
-    tick(cfg, now=NOW + 1200, client=_dead_client(), chain=fake)
+    fake.block = DUE_BLOCK
+    tick(cfg, now=NOW + INTERVAL_S, client=_dead_client(), chain=fake)
 
     # next epoch publishes: the fresh vector wins and applies immediately
     nxt = NOW + 604800
@@ -424,10 +428,10 @@ def test_a_recovered_provider_takes_over_from_the_cache(tmp_path):
 def test_a_corrupt_cache_is_not_submitted(tmp_path):
     cfg = _cfg(tmp_path)
     with open(cfg["state_file"], "w") as f:
-        json.dump({"last_applied": IDX, "last_submit_block": 5000,
+        json.dump({"last_applied": IDX, "last_submit_block": BASE_BLOCK,
                    "last_submit_ts": NOW, "cached_weights": "garbage"}, f)
-    fake = FakeChain(block=5100)
-    assert tick(cfg, now=NOW + 1200, client=_dead_client(),
+    fake = FakeChain(block=DUE_BLOCK)
+    assert tick(cfg, now=NOW + INTERVAL_S, client=_dead_client(),
                 chain=fake) == "fetch-failed"
     assert fake.submitted == []
 
@@ -455,12 +459,12 @@ def test_resubmit_interval_is_overridable_for_a_higher_weights_rate_limit(tmp_pa
     assert load_config()["resubmit_blocks"] == 500
 
     cfg = _cfg(tmp_path) | {"resubmit_blocks": 500}
-    fake = FakeChain(block=5000)
+    fake = FakeChain(block=BASE_BLOCK)
     tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
-    # 100 blocks would have been enough at the default; 500 is not yet reached
-    fake.block = 5100
+    # the default interval would have been enough; 500 is not yet reached
+    fake.block = BASE_BLOCK + RESUBMIT_BLOCKS
     assert tick(cfg, now=NOW + 6000, client=_client(_payload()),
                 chain=fake) == "skipped:too-soon"
-    fake.block = 5500
+    fake.block = BASE_BLOCK + 500
     assert tick(cfg, now=NOW + 6000, client=_client(_payload()),
                 chain=fake) == "resubmitted"

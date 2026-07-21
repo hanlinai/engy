@@ -17,9 +17,26 @@ ambiguous case below therefore resolves toward submitting.
 """
 from __future__ import annotations
 
-RESUBMIT_BLOCKS = 100      # ≈20 min at 12s blocks, far inside activity_cutoff
+# SN53's on-chain weights_rate_limit is 100 blocks (verified on finney), and
+# the interval must clear it with room to spare rather than merely equal it.
+# Our anchor is the block read *before* submitting, while the chain anchors on
+# the block the extrinsic actually executed in — always the later of the two.
+# At exactly 100 the first attempt of every cycle is refused as
+# SettingWeightsTooFast, recovering only on the next poll: self-healing, but it
+# burns an extrinsic and logs a failure every ~20 minutes, which is precisely
+# the kind of recurring false alarm that hides a real one.
+#
+# The margin has to cover the *inclusion lag*, not the poll interval: poll
+# granularity only ever delays a submission, and late is always safe. 120
+# tolerates a 20-block (~4 min) lag, far beyond what wait_for_inclusion
+# normally sees, and is still ~40x inside activity_cutoff (5000).
+RESUBMIT_BLOCKS = 120      # ≈24 min at 12s blocks
 BLOCK_S = 12               # nominal block time, for wall-clock fallback only
 PREGATE_FRACTION = 0.8     # pre-gate skips below 80% of the interval
+
+# The chain hyperparameter this interval must stay above. Kept as a named
+# constant so the margin is asserted in tests rather than assumed.
+WEIGHTS_RATE_LIMIT = 100
 
 
 def should_submit(*, epoch_index: int, last_applied: int | None,

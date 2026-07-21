@@ -98,3 +98,30 @@ def test_pregate_is_strictly_more_conservative_than_should_submit():
             assert should_submit(epoch_index=12, last_applied=12,
                                  current_block=None, last_submit_block=None,
                                  now=now, last_submit_ts=TS) is False
+
+
+def test_the_interval_clears_the_chain_rate_limit_with_margin():
+    # SN53's weights_rate_limit is 100 blocks. Our anchor is the block read
+    # before submitting; the chain's is the block the extrinsic executed in,
+    # which is always later. An interval merely equal to the rate limit is
+    # therefore refused as SettingWeightsTooFast on the first attempt of every
+    # cycle. Keep real headroom, and keep it far inside activity_cutoff.
+    # The margin covers inclusion lag, not poll granularity — a late poll only
+    # delays a submission, and late is always safe.
+    from validator.schedule import WEIGHTS_RATE_LIMIT
+    assert RESUBMIT_BLOCKS > WEIGHTS_RATE_LIMIT
+    assert RESUBMIT_BLOCKS - WEIGHTS_RATE_LIMIT >= 10   # ≥2 min of lag headroom
+    assert RESUBMIT_BLOCKS * 10 < 5000                  # activity_cutoff
+
+
+def test_an_inclusion_lag_of_several_blocks_still_clears_the_rate_limit():
+    # Concrete replay of the failure this margin prevents: we anchor on the
+    # block we read, the extrinsic lands a few blocks later, and the chain
+    # measures from there.
+    from validator.schedule import WEIGHTS_RATE_LIMIT
+    read_block, inclusion_lag = 5000, 5
+    chain_anchor = read_block + inclusion_lag
+    first_due = read_block + RESUBMIT_BLOCKS
+    assert should_submit(epoch_index=12, last_applied=12, current_block=first_due,
+                         last_submit_block=read_block, now=TS, last_submit_ts=TS)
+    assert first_due - chain_anchor >= WEIGHTS_RATE_LIMIT
