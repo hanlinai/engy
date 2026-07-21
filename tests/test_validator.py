@@ -6,9 +6,13 @@ import httpx
 import pytest
 from substrateinterface import Keypair
 
+from validator import chain as chain_mod
+from validator.state import (
+    read_state, last_applied, last_submit_block, cached_weights,
+)
 from validator.sync import epoch_message, MAX_RESPONSE_BYTES
 from validator.validator import (
-    tick, _last_applied, _heartbeat_age, _watchdog_check, stall_limit, healthcheck,
+    tick, _heartbeat_age, _watchdog_check, stall_limit, healthcheck,
 )
 
 GENESIS = 1784505600
@@ -42,12 +46,54 @@ def _payload(*, weights_top_level=None):
     }
 
 
+def _payload_with(weights):
+    """A genuine payload carrying an arbitrary verified weight vector."""
+    rj = json.dumps({"epoch_end": END, "epoch_index": IDX,
+                     "epoch_start": END - 604800, "miners": [], "netuid": 53,
+                     "params": {}, "v": 1, "weights": weights},
+                    sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(rj.encode("utf-8")).hexdigest()
+    return {"v": 1, "netuid": 53, "epoch_index": IDX,
+            "epoch_start": END - 604800, "epoch_end": END, "digest": digest,
+            "result_json": rj, "weights": weights,
+            "signed_hotkey": MASTER.ss58_address,
+            "signature": MASTER.sign(epoch_message(53, IDX, digest).encode()).hex(),
+            "signed_at": END + 610}
+
+
 def _cfg(tmp_path):
     return {"api": "https://engy.example", "master_hotkey": MASTER.ss58_address,
             "netuid": 53, "genesis": GENESIS, "network": "finney",
-            "wallet": "w", "wallet_hotkey": "hk", "poll_s": 600,
+            "wallet": "w", "wallet_hotkey": "hk", "poll_s": 300,
             "state_file": str(tmp_path / "state.json"),
             "heartbeat_file": str(tmp_path / "heartbeat.json")}
+
+
+class FakeChain:
+    """Stands in for validator.chain, recording what reached the chain."""
+
+    def __init__(self, hotkeys=("5Aaa",), block=5000, ok=True, open_raises=False):
+        self.hotkeys = list(hotkeys)
+        self.block = block
+        self.ok = ok
+        self.open_raises = open_raises
+        self.submitted = []
+        self.opens = 0
+
+    def open_chain(self, *, network, netuid):
+        self.opens += 1
+        if self.open_raises:
+            raise RuntimeError("subtensor unreachable")
+        return chain_mod.ChainView(sub=object(), hotkeys=self.hotkeys,
+                                   block=self.block)
+
+    resolve_uids = staticmethod(chain_mod.resolve_uids)
+    skipped_hotkeys = staticmethod(chain_mod.skipped_hotkeys)
+    dropped_weight_share = staticmethod(chain_mod.dropped_weight_share)
+
+    def set_weights(self, view, *, wallet, wallet_hotkey, netuid, uids, ws):
+        self.submitted.append((uids, ws))
+        return self.ok
 
 
 def _client(payload):
@@ -55,18 +101,108 @@ def _client(payload):
         lambda req: httpx.Response(200, json=payload)))
 
 
-def test_applied_then_deduplicated(tmp_path):
+def _dead_client():
+    return httpx.Client(transport=httpx.MockTransport(
+        lambda req: httpx.Response(503)))
+
+
+# ── submission scheduling ────────────────────────────────────────
+
+def test_new_epoch_applies_and_records_every_state_field(tmp_path):
     cfg = _cfg(tmp_path)
-    submitted = []
-    ok = tick(cfg, now=NOW, client=_client(_payload()),
-              submit_fn=lambda c, w: submitted.append(w) or True)
-    assert ok == "applied"
-    assert submitted == [[["5Aaa", 65535]]]
-    assert json.load(open(cfg["state_file"])) == {"last_applied": IDX}
-    # second tick with the same payload: already applied, no resubmission
-    assert tick(cfg, now=NOW, client=_client(_payload()),
-                submit_fn=lambda c, w: submitted.append(w) or True) == "rejected:already-applied"
-    assert len(submitted) == 1
+    fake = FakeChain(block=5000)
+    assert tick(cfg, now=NOW, client=_client(_payload()), chain=fake) == "applied"
+    assert fake.submitted == [([0], [65535])]
+    s = read_state(cfg["state_file"])
+    assert last_applied(s) == IDX
+    assert last_submit_block(s) == 5000
+    assert cached_weights(s) == [["5Aaa", 65535]]
+
+
+def test_same_epoch_holds_until_the_resubmit_interval(tmp_path):
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(block=5000)
+    tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
+    # 99 blocks later, past the pre-gate but short of the interval
+    fake.block = 5099
+    out = tick(cfg, now=NOW + 1000, client=_client(_payload()), chain=fake)
+    assert out == "skipped:too-soon"
+    assert len(fake.submitted) == 1
+
+
+def test_same_epoch_resubmits_at_100_blocks(tmp_path):
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(block=5000)
+    tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
+    fake.block = 5100
+    out = tick(cfg, now=NOW + 1200, client=_client(_payload()), chain=fake)
+    assert out == "resubmitted"
+    assert fake.submitted == [([0], [65535]), ([0], [65535])]
+    s = read_state(cfg["state_file"])
+    assert last_submit_block(s) == 5100      # advances
+    assert last_applied(s) == IDX            # unchanged — same epoch
+
+
+def test_the_pregate_avoids_opening_a_connection_when_clearly_too_early(tmp_path):
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(block=5000)
+    tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
+    assert fake.opens == 1
+    out = tick(cfg, now=NOW + 300, client=_client(_payload()), chain=fake)
+    assert out == "skipped:too-soon"
+    assert fake.opens == 1                   # no second connection
+
+
+def test_a_missing_block_number_falls_back_to_the_wall_clock(tmp_path):
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(block=None)
+    assert tick(cfg, now=NOW, client=_client(_payload()), chain=fake) == "applied"
+    assert last_submit_block(read_state(cfg["state_file"])) is None
+    # 1199s later: still short of the 1200s fallback interval
+    assert tick(cfg, now=NOW + 1199, client=_client(_payload()),
+                chain=fake) == "skipped:too-soon"
+    assert tick(cfg, now=NOW + 1200, client=_client(_payload()),
+                chain=fake) == "resubmitted"
+
+
+# ── failure containment ──────────────────────────────────────────
+
+def test_submit_failure_advances_no_state_field(tmp_path):
+    # The invariant that makes the whole schedule safe: advancing
+    # last_submit_block on a failure would make the loop believe it had just
+    # submitted and wait a full interval before retrying, amplifying a
+    # transient chain error into 20 minutes of silence.
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(ok=False)
+    assert tick(cfg, now=NOW, client=_client(_payload()), chain=fake) == "submit-failed"
+    assert read_state(cfg["state_file"]) == {}
+
+    fake.ok = True
+    assert tick(cfg, now=NOW + 1, client=_client(_payload()), chain=fake) == "applied"
+
+
+def test_a_failed_resubmit_retries_on_the_next_poll_not_a_full_interval_later(tmp_path):
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(block=5000)
+    tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
+
+    fake.block, fake.ok = 5100, False
+    assert tick(cfg, now=NOW + 1200, client=_client(_payload()),
+                chain=fake) == "submit-failed"
+    assert last_submit_block(read_state(cfg["state_file"])) == 5000  # not advanced
+
+    # one poll later (300s, 25 blocks) the retry goes through
+    fake.block, fake.ok = 5125, True
+    assert tick(cfg, now=NOW + 1500, client=_client(_payload()),
+                chain=fake) == "resubmitted"
+
+
+def test_an_unreachable_chain_is_contained_and_leaves_state_alone(tmp_path):
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(open_raises=True)
+    assert tick(cfg, now=NOW, client=_client(_payload()), chain=fake) == "chain-failed"
+    assert read_state(cfg["state_file"]) == {}
+    assert _heartbeat_age(cfg["heartbeat_file"], now=NOW) == 0.0
 
 
 def test_evil_top_level_weights_never_reach_submit(tmp_path):
@@ -74,43 +210,33 @@ def test_evil_top_level_weights_never_reach_submit(tmp_path):
     # display-only top-level `weights` field, but the daemon must submit the
     # weights extracted from the verified result_json, not the evil field.
     cfg = _cfg(tmp_path)
+    fake = FakeChain(hotkeys=["5Aaa"])
     p = _payload(weights_top_level=[["5Evil", 65535]])
-    submitted = []
-    out = tick(cfg, now=NOW, client=_client(p),
-               submit_fn=lambda c, w: submitted.append(w) or True)
+    out = tick(cfg, now=NOW, client=_client(p), chain=fake)
+    # 5Evil is not on chain, so had the evil field been used there would be no
+    # uid to submit at all — reaching "applied" proves result_json won.
     assert out == "applied"
-    assert submitted == [[["5Aaa", 65535]]]
-    assert submitted != [p["weights"]]
+    assert fake.submitted == [([0], [65535])]
 
 
 def test_bad_signature_never_reaches_chain(tmp_path):
     p = _payload()
     p["signature"] = "00" * 64
-    called = []
-    out = tick(_cfg(tmp_path), now=NOW, client=_client(p),
-               submit_fn=lambda c, w: called.append(1) or True)
-    assert out == "rejected:signature" and called == []
+    fake = FakeChain()
+    out = tick(_cfg(tmp_path), now=NOW, client=_client(p), chain=fake)
+    assert out == "rejected:signature"
+    assert fake.submitted == [] and fake.opens == 0
 
 
 def test_fetch_failure_is_contained(tmp_path):
-    client = httpx.Client(transport=httpx.MockTransport(
-        lambda req: httpx.Response(503)))
-    assert tick(_cfg(tmp_path), now=NOW, client=client,
-                submit_fn=lambda c, w: True) == "fetch-failed"
-
-
-def test_submit_failure_does_not_advance_state(tmp_path):
-    cfg = _cfg(tmp_path)
-    out = tick(cfg, now=NOW, client=_client(_payload()), submit_fn=lambda c, w: False)
-    assert out == "submit-failed"
-    # state not written → next tick retries the same epoch
-    out = tick(cfg, now=NOW, client=_client(_payload()), submit_fn=lambda c, w: True)
-    assert out == "applied"
+    assert tick(_cfg(tmp_path), now=NOW, client=_dead_client(),
+                chain=FakeChain()) == "fetch-failed"
 
 
 def test_non_dict_response_is_rejected_not_raised(tmp_path):
-    client = httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=[1, 2, 3])))
-    out = tick(_cfg(tmp_path), now=NOW, client=client, submit_fn=lambda c, w: True)
+    client = httpx.Client(transport=httpx.MockTransport(
+        lambda req: httpx.Response(200, json=[1, 2, 3])))
+    out = tick(_cfg(tmp_path), now=NOW, client=client, chain=FakeChain())
     assert out == "rejected:malformed"
 
 
@@ -118,55 +244,49 @@ def test_oversized_response_is_treated_as_fetch_failure(tmp_path):
     huge = b"[" + b"1" * (MAX_RESPONSE_BYTES + 1) + b"]"
     client = httpx.Client(transport=httpx.MockTransport(
         lambda req: httpx.Response(200, content=huge,
-                                    headers={"content-type": "application/json"})))
-    out = tick(_cfg(tmp_path), now=NOW, client=client, submit_fn=lambda c, w: True)
+                                   headers={"content-type": "application/json"})))
+    out = tick(_cfg(tmp_path), now=NOW, client=client, chain=FakeChain())
     assert out == "fetch-failed"
 
 
-def test_last_applied_survives_corrupt_state_file(tmp_path):
-    state = tmp_path / "state.json"
-    # non-int last_applied
-    state.write_text(json.dumps({"last_applied": "twelve"}))
-    assert _last_applied(str(state)) is None
-    # bool last_applied (bool is a subclass of int — must not pass through)
-    state.write_text(json.dumps({"last_applied": True}))
-    assert _last_applied(str(state)) is None
-    # non-dict top-level JSON
-    state.write_text(json.dumps([1, 2, 3]))
-    assert _last_applied(str(state)) is None
-    # invalid JSON entirely
-    state.write_text("not json at all")
-    assert _last_applied(str(state)) is None
-    # a genuinely valid file still round-trips
-    state.write_text(json.dumps({"last_applied": 7}))
-    assert _last_applied(str(state)) == 7
+# ── on-chain identity check (logs, never blocks) ─────────────────
+
+def test_an_unregistered_hotkey_is_dropped_and_logged_never_blocking(tmp_path, capsys):
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(hotkeys=["5Aaa"])
+    client = httpx.Client(transport=httpx.MockTransport(
+        lambda req: httpx.Response(200, json=_payload_with(
+            [["5Aaa", 40000], ["5Gone", 25535]]))))
+    assert tick(cfg, now=NOW, client=client, chain=fake) == "applied"
+    assert fake.submitted == [([0], [65535])]        # renormalized onto 5Aaa
+    out = capsys.readouterr().out
+    assert "5Gone" in out and "39.0%" in out
 
 
 # ── liveness (heartbeat + watchdog) ──────────────────────────────
 
 def test_heartbeat_is_written_on_every_outcome_not_just_applied(tmp_path):
-    # The state file only moves once a week, when an epoch is applied, so it is
-    # useless as a liveness signal. The heartbeat must advance on every tick,
-    # including the ones that reject or fail.
+    # The state file only moves when a submission lands, so it is useless as a
+    # liveness signal. The heartbeat must advance on every tick, including the
+    # ones that skip, reject, or fail.
     cfg = _cfg(tmp_path)
     hb = cfg["heartbeat_file"]
 
-    tick(cfg, now=NOW, client=_client(_payload()), submit_fn=lambda c, w: True)
+    tick(cfg, now=NOW, client=_client(_payload()), chain=FakeChain())
     assert _heartbeat_age(hb, now=NOW) == 0.0
 
-    # a rejected tick 100s later still proves the loop is alive
-    tick(cfg, now=NOW + 100, client=_client(_payload()), submit_fn=lambda c, w: True)
+    # a skipped tick 100s later still proves the loop is alive
+    tick(cfg, now=NOW + 100, client=_client(_payload()), chain=FakeChain())
     assert _heartbeat_age(hb, now=NOW + 100) == 0.0
 
     # ...and a fetch failure too
-    dead = httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(503)))
-    tick(cfg, now=NOW + 200, client=dead, submit_fn=lambda c, w: True)
+    tick(cfg, now=NOW + 200, client=_dead_client(), chain=FakeChain())
     assert _heartbeat_age(hb, now=NOW + 200) == 0.0
 
 
 def test_heartbeat_age_grows_when_the_loop_stops_ticking(tmp_path):
     cfg = _cfg(tmp_path)
-    tick(cfg, now=NOW, client=_client(_payload()), submit_fn=lambda c, w: True)
+    tick(cfg, now=NOW, client=_client(_payload()), chain=FakeChain())
     assert _heartbeat_age(cfg["heartbeat_file"], now=NOW + 3600) == 3600.0
 
 
@@ -189,7 +309,7 @@ def test_stall_limit_leaves_room_for_a_slow_tick(tmp_path):
 def test_watchdog_exits_only_after_the_stall_limit(tmp_path):
     cfg = _cfg(tmp_path)
     hb = cfg["heartbeat_file"]
-    tick(cfg, now=NOW, client=_client(_payload()), submit_fn=lambda c, w: True)
+    tick(cfg, now=NOW, client=_client(_payload()), chain=FakeChain())
 
     exits = []
     # healthy: one poll interval later, well inside the limit
