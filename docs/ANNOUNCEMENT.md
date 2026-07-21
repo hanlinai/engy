@@ -1,6 +1,6 @@
-# Engy (SN53): verified inference for frontier open models
+# engy (SN53): verified inference for frontier open models
 
-[Engy](https://engy.ai) is an inference provider. Buyers hit one public endpoint and get frontier
+[engy](https://engy.ai) is an inference provider. Buyers hit one public endpoint and get frontier
 open models; a permissionless, global fleet of GPU miners serves the tokens. Every
 response carries a cryptographic commitment that the named model produced it, and
 weightless validators verify a sample and set weights on chain.
