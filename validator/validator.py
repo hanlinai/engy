@@ -1,8 +1,15 @@
 """The light-validator loop: poll the engy provider API, verify, set weights (spec §2).
 
-Failure posture (spec §10): on ANY failure — API down, bad signature, stale
-epoch, chain error — do nothing. The chain persists the last submitted
-weights, so inaction is always the safe move.
+Failure posture (spec §10): never submit anything unverified. A bad signature,
+a stale epoch or a malformed payload submits nothing at all.
+
+That posture is *not* extended to silence. A validator whose last_update
+exceeds the subnet's activity_cutoff (~5000 blocks) is treated as inactive and
+drops out of Yuma consensus, so submitting once per epoch and then waiting
+would forfeit most of the epoch's dividends. The verified vector is therefore
+resubmitted every RESUBMIT_BLOCKS for the whole epoch, and a provider outage
+falls back to the last vector this validator actually put on chain — the same
+weights either way, but still counted as alive.
 """
 from __future__ import annotations
 
@@ -15,7 +22,7 @@ import time
 import httpx
 
 from . import chain as _chain
-from .schedule import pregate_skip, should_submit
+from .schedule import RESUBMIT_BLOCKS, pregate_skip, should_submit
 from .state import (
     cached_weights, last_applied, last_submit_block, last_submit_ts,
     read_state, write_state,
@@ -38,7 +45,9 @@ def load_config() -> dict:
         "network": env.get("ENGY_SN53_NETWORK", "finney"),
         "wallet": env.get("ENGY_SN53_WALLET", "default"),
         "wallet_hotkey": env.get("ENGY_SN53_WALLET_HOTKEY", "default"),
-        "poll_s": int(env.get("ENGY_SN53_POLL_S", "600")),
+        "poll_s": int(env.get("ENGY_SN53_POLL_S", "300")),
+        "resubmit_blocks": int(env.get("ENGY_SN53_RESUBMIT_BLOCKS",
+                                       str(RESUBMIT_BLOCKS))),
         "state_file": state_file,
         "heartbeat_file": env.get(
             "ENGY_SN53_HEARTBEAT_FILE",
@@ -50,10 +59,11 @@ def load_config() -> dict:
 #
 # `restart: unless-stopped` only recovers a process that *exits*. A loop wedged
 # inside a chain call stays "running" forever while silently submitting
-# nothing. The state file is no help as a liveness signal — it only advances
-# when an epoch is applied, i.e. once a week. So every tick stamps a heartbeat
-# regardless of outcome, a watchdog thread turns a stall into an exit, and the
-# container HEALTHCHECK reads the same file for `docker ps` visibility.
+# nothing. The state file is no help as a liveness signal — it only advances on
+# a successful submit, and most ticks legitimately skip because the resubmit
+# interval is several polls long. So every tick stamps a heartbeat regardless
+# of outcome, a watchdog thread turns a stall into an exit, and the container
+# HEALTHCHECK reads the same file for `docker ps` visibility.
 
 WATCHDOG_INTERVAL_S = 30
 MIN_STALL_LIMIT_S = 900
@@ -185,7 +195,9 @@ def _run_tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
         return failure
 
     is_new_epoch = applied is None or epoch > applied
-    if not is_new_epoch and pregate_skip(now=now, last_submit_ts=last_submit_ts(state)):
+    interval = cfg.get("resubmit_blocks", RESUBMIT_BLOCKS)
+    if not is_new_epoch and pregate_skip(now=now, last_submit_ts=last_submit_ts(state),
+                                         interval_blocks=interval):
         return "skipped:too-soon"
 
     try:
@@ -200,7 +212,8 @@ def _run_tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
     previous_block = last_submit_block(state)
     if not should_submit(epoch_index=epoch, last_applied=applied,
                          current_block=view.block, last_submit_block=previous_block,
-                         now=now, last_submit_ts=last_submit_ts(state)):
+                         now=now, last_submit_ts=last_submit_ts(state),
+                         interval_blocks=interval):
         return "skipped:too-soon"
 
     dropped = chain.skipped_hotkeys(weights, view.hotkeys)

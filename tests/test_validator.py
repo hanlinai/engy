@@ -430,3 +430,37 @@ def test_a_corrupt_cache_is_not_submitted(tmp_path):
     assert tick(cfg, now=NOW + 1200, client=_dead_client(),
                 chain=fake) == "fetch-failed"
     assert fake.submitted == []
+
+
+def test_poll_default_leaves_room_under_the_resubmit_interval(monkeypatch):
+    # POLL_S drives resubmit scheduling, so it must stay well below the
+    # interval or precision is lost to poll granularity.
+    from validator.schedule import BLOCK_S, RESUBMIT_BLOCKS
+    from validator.validator import load_config
+    monkeypatch.setenv("ENGY_SN53_API", "https://engy.example")
+    monkeypatch.setenv("ENGY_SN53_MASTER_HOTKEY", MASTER.ss58_address)
+    monkeypatch.delenv("ENGY_SN53_POLL_S", raising=False)
+    poll = load_config()["poll_s"]
+    assert poll == 300
+    assert poll * 4 <= RESUBMIT_BLOCKS * BLOCK_S
+
+
+def test_resubmit_interval_is_overridable_for_a_higher_weights_rate_limit(tmp_path, monkeypatch):
+    # A subnet whose weights_rate_limit exceeds 100 would refuse every
+    # submission at the default cadence, so the interval must be raisable.
+    from validator.validator import load_config
+    monkeypatch.setenv("ENGY_SN53_API", "https://engy.example")
+    monkeypatch.setenv("ENGY_SN53_MASTER_HOTKEY", MASTER.ss58_address)
+    monkeypatch.setenv("ENGY_SN53_RESUBMIT_BLOCKS", "500")
+    assert load_config()["resubmit_blocks"] == 500
+
+    cfg = _cfg(tmp_path) | {"resubmit_blocks": 500}
+    fake = FakeChain(block=5000)
+    tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
+    # 100 blocks would have been enough at the default; 500 is not yet reached
+    fake.block = 5100
+    assert tick(cfg, now=NOW + 6000, client=_client(_payload()),
+                chain=fake) == "skipped:too-soon"
+    fake.block = 5500
+    assert tick(cfg, now=NOW + 6000, client=_client(_payload()),
+                chain=fake) == "resubmitted"

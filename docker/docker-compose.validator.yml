@@ -2,9 +2,9 @@
 #
 # Watchtower auto-updates the image from GHCR: cut a `v*` tag in the repo and
 # CI publishes ghcr.io/hanlinai/engy:latest, which watchtower pulls within the
-# poll interval and recreates the validator container. State (last_applied)
-# lives in a named volume, so an update never re-submits an already-applied
-# epoch.
+# poll interval and recreates the validator container. Submission state lives
+# in a named volume, so a restart resumes the resubmit schedule instead of
+# starting the epoch over.
 #
 # Setup:
 #   1. cp .env.validator.example .env.validator  and fill it in
