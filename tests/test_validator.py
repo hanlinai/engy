@@ -4,7 +4,7 @@ import time
 
 import httpx
 import pytest
-from substrateinterface import Keypair
+from bittensor_wallet import Keypair
 
 from validator import chain as chain_mod
 from validator.chain import EXPECTED_OWNER_HOTKEY
