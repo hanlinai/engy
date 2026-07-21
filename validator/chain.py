@@ -110,17 +110,43 @@ def dropped_weight_share(weights: list[list], hotkeys_on_chain: list[str]) -> fl
     return sum(w for hk, w in weights if hk not in registered) / total
 
 
+def _extrinsic_result(res) -> tuple[bool, str]:
+    """Whether the chain accepted the extrinsic, and why not if it did not.
+
+    bittensor 10.x returns an ExtrinsicResponse. It mimics a tuple —
+    ``res[0]`` is the success flag, ``len(res)`` is 2 — but it is NOT a tuple
+    instance and defines no ``__bool__``, so ``bool(res)`` is True for a
+    REJECTED extrinsic just as surely as an accepted one.
+
+    Reading it that way turns every rejection into a recorded success: state
+    advances, the loop waits out a full resubmit interval, and no weights ever
+    reach the chain while the validator looks perfectly healthy. Observed in
+    production — `set_weights(1 uids) -> True` against a uid whose on-chain
+    weights stayed empty and whose last_update never moved, because the hotkey
+    had no validator permit.
+
+    The message matters as much as the flag: "No validator permit" is a
+    problem an operator can act on, where a bare False is not.
+    """
+    success = getattr(res, "success", None)
+    if success is not None:
+        return bool(success), str(getattr(res, "message", "") or "")
+    if isinstance(res, tuple):                      # older SDKs: (bool, msg)
+        return bool(res[0]), str(res[1]) if len(res) > 1 else ""
+    return bool(res), ""
+
+
 def set_weights(view: ChainView, *, wallet: str, wallet_hotkey: str, netuid: int,
                 uids: list[int], ws: list[int]) -> bool:
     """Submit. False on any failure — the caller must not advance state."""
     try:
         import bittensor as bt
         wal = bt.Wallet(name=wallet, hotkey=wallet_hotkey)
-        ok = view.sub.set_weights(wallet=wal, netuid=netuid, uids=uids, weights=ws,
-                                  version_key=0, wait_for_inclusion=True)
-        # newer SDKs return (bool, msg)
-        ok = ok[0] if isinstance(ok, tuple) else bool(ok)
-        print(f"[chain] set_weights({len(uids)} uids) -> {ok}", flush=True)
+        res = view.sub.set_weights(wallet=wal, netuid=netuid, uids=uids, weights=ws,
+                                   version_key=0, wait_for_inclusion=True)
+        ok, why = _extrinsic_result(res)
+        print(f"[chain] set_weights({len(uids)} uids) -> {ok}"
+              f"{f' ({why})' if why else ''}", flush=True)
         return ok
     except Exception as e:
         # Broad on purpose: bittensor raises too varied a set for narrow

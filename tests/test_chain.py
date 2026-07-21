@@ -1,6 +1,6 @@
 from validator.chain import (
     EXPECTED_OWNER_HOTKEY, ChainView, burn_target, dropped_weight_share,
-    resolve_uids, skipped_hotkeys, _valid_block,
+    resolve_uids, set_weights, skipped_hotkeys, _valid_block,
 )
 
 
@@ -101,3 +101,65 @@ def test_the_expected_owner_matches_the_providers_configured_value():
     # A burn to an unregistered hotkey resolves to no uid at all, so nothing
     # is submitted and the validator silently sets no weights.
     assert EXPECTED_OWNER_HOTKEY == "5DXSBCCKH5ENuyHFNaAvtaMfbhEEWpjSJB4rzc4mJfsc1uvJ"
+
+
+# ── set_weights result handling ──────────────────────────────────
+
+class _ExtrinsicResponse:
+    """What bittensor 10.x returns. It mimics tuple access but is NOT a tuple
+    instance, and defines no __bool__ — so bool(response) is True even for a
+    rejected extrinsic."""
+
+    def __init__(self, success, message=""):
+        self.success, self.message = success, message
+
+    def __getitem__(self, i):
+        return (self.success, self.message)[i]
+
+    def __len__(self):
+        return 2
+
+
+class _FakeSub:
+    def __init__(self, result):
+        self.result = result
+
+    def set_weights(self, **kw):
+        return self.result
+
+
+def _submit(result, monkeypatch):
+    import sys
+    import types
+    fake_bt = types.ModuleType("bittensor")
+    fake_bt.Wallet = lambda **kw: object()
+    monkeypatch.setitem(sys.modules, "bittensor", fake_bt)
+    view = ChainView(sub=_FakeSub(result), hotkeys=["5A"], block=1)
+    return set_weights(view, wallet="w", wallet_hotkey="hk", netuid=53,
+                       uids=[0], ws=[65535])
+
+
+def test_a_rejected_extrinsic_is_not_read_as_success(monkeypatch):
+    # The object is truthy, so bool() reports a rejected extrinsic as a
+    # successful submission: the loop advances its state, waits out a full
+    # resubmit interval, and sets no weights at all while looking healthy.
+    assert bool(_ExtrinsicResponse(False, "No validator permit")) is True
+    assert _submit(_ExtrinsicResponse(False, "No validator permit"), monkeypatch) is False
+
+
+def test_an_accepted_extrinsic_is_read_as_success(monkeypatch):
+    assert _submit(_ExtrinsicResponse(True, "ok"), monkeypatch) is True
+
+
+def test_the_rejection_reason_reaches_the_log(monkeypatch, capsys):
+    # "No validator permit" is the difference between a problem an operator can
+    # fix and an outage they cannot explain.
+    _submit(_ExtrinsicResponse(False, "No validator permit"), monkeypatch)
+    assert "No validator permit" in capsys.readouterr().out
+
+
+def test_older_tuple_and_bare_bool_returns_still_work(monkeypatch):
+    assert _submit((False, "nope"), monkeypatch) is False
+    assert _submit((True, "ok"), monkeypatch) is True
+    assert _submit(False, monkeypatch) is False
+    assert _submit(True, monkeypatch) is True
