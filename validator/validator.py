@@ -138,25 +138,39 @@ def tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
 
 
 def _resolve_weights(cfg: dict, state: dict, *, now: float,
-                     client: httpx.Client | None) -> tuple[list | None, int | None, str | None]:
+                     client: httpx.Client | None) -> tuple[list | None, int | None, bool, str | None]:
     """Pick the vector to submit: a freshly verified one, else the cache.
 
-    Returns (weights, epoch_index, failure). `failure` is a tick return code
-    when nothing could be resolved, and None otherwise.
+    Returns (weights, epoch_index, from_cache, failure). `failure` is a tick
+    return code when nothing could be resolved, and None otherwise.
+
+    The cache holds the last vector this validator actually put on chain, so
+    falling back to it changes nothing about what miners receive — weights are
+    constant within an epoch. It exists so a provider outage cannot take the
+    validator off chain: stopping would keep the same weights on chain while
+    costing us our own consensus membership.
     """
+    failure = "fetch-failed"
     try:
         payload = fetch_weights(cfg["api"], client=client)
     except (httpx.HTTPError, ValueError) as e:
         print(f"[sync] fetch failed: {e}", flush=True)
-        return None, None, "fetch-failed"
-
-    ok, reason, weights, idx = verify_payload(
-        payload, master_hotkey=cfg["master_hotkey"], netuid=cfg["netuid"],
-        genesis=cfg["genesis"], now=now)
-    if not ok:
+    else:
+        ok, reason, weights, idx = verify_payload(
+            payload, master_hotkey=cfg["master_hotkey"], netuid=cfg["netuid"],
+            genesis=cfg["genesis"], now=now)
+        if ok:
+            return weights, idx, False, None
         print(f"[sync] payload rejected: {reason}", flush=True)
-        return None, None, f"rejected:{reason}"
-    return weights, idx, None
+        failure = f"rejected:{reason}"
+
+    applied = last_applied(state)
+    cached = cached_weights(state)
+    if cached is None or applied is None:
+        return None, None, False, failure
+    print(f"[sync] no usable payload ({failure}) — resubmitting cached epoch "
+          f"{applied} vector ({len(cached)} hotkeys)", flush=True)
+    return cached, applied, True, None
 
 
 def _run_tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
@@ -165,7 +179,8 @@ def _run_tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
     state = read_state(cfg["state_file"])
     applied = last_applied(state)
 
-    weights, epoch, failure = _resolve_weights(cfg, state, now=now, client=client)
+    weights, epoch, from_cache, failure = _resolve_weights(
+        cfg, state, now=now, client=client)
     if failure is not None:
         return failure
 
@@ -215,6 +230,8 @@ def _run_tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
            else view.block - previous_block)
     print(f"[sync] epoch {epoch}: submitted {len(uids)} uids "
           f"({gap} blocks since last submit)", flush=True)
+    if from_cache:
+        return "resubmitted:cached"
     return "applied" if is_new_epoch else "resubmitted"
 
 

@@ -349,3 +349,84 @@ def test_healthcheck_exits_nonzero_on_a_stale_heartbeat(tmp_path, monkeypatch, c
     with pytest.raises(SystemExit) as e:
         healthcheck()
     assert e.value.code != 0
+
+
+# ── provider-outage fallback ─────────────────────────────────────
+
+def test_a_provider_outage_keeps_resubmitting_the_cached_vector(tmp_path):
+    # Without this the validator goes silent through the outage and passes
+    # activity_cutoff, dropping out of consensus for the rest of the epoch.
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(block=5000)
+    tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
+
+    fake.block = 5100
+    out = tick(cfg, now=NOW + 1200, client=_dead_client(), chain=fake)
+    assert out == "resubmitted:cached"
+    assert fake.submitted == [([0], [65535]), ([0], [65535])]
+    assert last_submit_block(read_state(cfg["state_file"])) == 5100
+
+
+def test_the_cache_still_respects_the_resubmit_interval(tmp_path):
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(block=5000)
+    tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
+    fake.block = 5050
+    assert tick(cfg, now=NOW + 1000, client=_dead_client(),
+                chain=fake) == "skipped:too-soon"
+    assert len(fake.submitted) == 1
+
+
+def test_a_stale_epoch_during_rollover_falls_back_to_the_cache(tmp_path):
+    # After a new epoch opens but before the provider publishes it, the served
+    # payload is rejected as stale. Keep submitting instead of going silent.
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(block=5000)
+    tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
+
+    fake.block = 5100
+    rolled = NOW + 604800          # one epoch later; IDX is now two epochs old
+    out = tick(cfg, now=rolled, client=_client(_payload()), chain=fake)
+    assert out == "resubmitted:cached"
+    assert len(fake.submitted) == 2
+
+
+def test_no_cache_and_no_payload_submits_nothing(tmp_path):
+    cfg = _cfg(tmp_path)
+    fake = FakeChain()
+    assert tick(cfg, now=NOW, client=_dead_client(), chain=fake) == "fetch-failed"
+    assert fake.submitted == [] and fake.opens == 0
+
+
+def test_a_recovered_provider_takes_over_from_the_cache(tmp_path):
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(block=5000)
+    tick(cfg, now=NOW, client=_client(_payload()), chain=fake)
+    fake.block = 5100
+    tick(cfg, now=NOW + 1200, client=_dead_client(), chain=fake)
+
+    # next epoch publishes: the fresh vector wins and applies immediately
+    nxt = NOW + 604800
+    p = _payload_with([["5Bbb", 65535]])
+    p["epoch_index"] = IDX + 1
+    rj = json.loads(p["result_json"]); rj["epoch_index"] = IDX + 1
+    p["result_json"] = json.dumps(rj, sort_keys=True, separators=(",", ":"))
+    p["digest"] = hashlib.sha256(p["result_json"].encode()).hexdigest()
+    p["signature"] = MASTER.sign(epoch_message(53, IDX + 1, p["digest"]).encode()).hex()
+
+    fake.hotkeys = ["5Aaa", "5Bbb"]
+    assert tick(cfg, now=nxt, client=_client(p), chain=fake) == "applied"
+    s = read_state(cfg["state_file"])
+    assert last_applied(s) == IDX + 1
+    assert cached_weights(s) == [["5Bbb", 65535]]
+
+
+def test_a_corrupt_cache_is_not_submitted(tmp_path):
+    cfg = _cfg(tmp_path)
+    with open(cfg["state_file"], "w") as f:
+        json.dump({"last_applied": IDX, "last_submit_block": 5000,
+                   "last_submit_ts": NOW, "cached_weights": "garbage"}, f)
+    fake = FakeChain(block=5100)
+    assert tick(cfg, now=NOW + 1200, client=_dead_client(),
+                chain=fake) == "fetch-failed"
+    assert fake.submitted == []
