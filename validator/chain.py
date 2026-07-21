@@ -13,14 +13,20 @@ from dataclasses import dataclass
 
 U16 = 65535
 
-# netuid 53's on-chain SubnetOwnerHotkey (uid 161) — where a burn should pay
-# out. A tripwire for a misconfigured owner_hotkey on the provider, which
-# otherwise fails silently: a burn to an unregistered hotkey resolves to no
-# uid, so the validator submits nothing and just looks idle.
+# The provider's configured owner_hotkey — where a burn pays out. Registered
+# on netuid 53 at uid 229. Note this is deliberately NOT the chain's
+# SubnetOwnerHotkey (5F2HTUq…, uid 161); it is the same key as the master
+# hotkey that signs epoch results.
 #
-# Warns, never rejects — a blocking check would take every third-party
-# validator offline the moment subnet ownership legitimately changed hands.
-EXPECTED_OWNER_HOTKEY = "5F2HTUqtk9VWQwXkkUX9oFSXUkAib74qw7s3W7KyZP88AmYe"
+# A tripwire for a misconfigured owner_hotkey on the provider, which otherwise
+# fails silently: a burn to an unregistered hotkey resolves to no uid, so the
+# validator submits nothing and just looks idle.
+#
+# Warns, never rejects. v0.2.0 shipped the chain's SubnetOwnerHotkey here,
+# inferred from chain state rather than confirmed against the provider's
+# config — wrong, and a blocking check would have made that guess take every
+# third-party validator offline on the first burn.
+EXPECTED_OWNER_HOTKEY = "5DXSBCCKH5ENuyHFNaAvtaMfbhEEWpjSJB4rzc4mJfsc1uvJ"
 
 
 def burn_target(weights: list[list]) -> str | None:
