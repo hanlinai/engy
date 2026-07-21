@@ -2,6 +2,20 @@
 
 Date: 2026-07-18
 
+> **Amendment 2026-07-21 — the endpoint below was renamed.**
+> `GET /api/subnet/v1/weights/latest` is now
+> `GET /api/subnet/v1/epoch/latest`. The old path was **deleted with no
+> alias**: no validator was running on chain yet, so the incompatible change
+> was free. The old name read as "the vector to submit on chain", which
+> undersells the payload — the top-level `weights` is an untrusted
+> convenience copy and the authoritative one lives inside the signed
+> `result_json` — and the endpoint now sits with the rest of the `/epoch/*`
+> family alongside `current` (in flight) and `{index}` (any epoch).
+> The payload contract, the signing message and every verification rule in
+> this document are unchanged; only the path moved. Implemented in
+> `validator/sync.py` `fetch_weights()`. Everything below is the 2026-07-18
+> record and still uses the old path.
+
 ## Background
 
 The light validator polls `GET {ENGY_SN53_API}/api/subnet/v1/weights/latest`
