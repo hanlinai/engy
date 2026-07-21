@@ -1,9 +1,6 @@
-# engy launches on SN53: verified inference, paid for by real buyers
+# Engy (SN53): verified inference for frontier open models
 
-**netuid 53: engy's permissionless GPU fleet, serving frontier open models with a
-proof that every response came from the real model.**
-
-engy is an inference provider. Buyers hit one public endpoint and get frontier
+[Engy](https://engy.ai) is an inference provider. Buyers hit one public endpoint and get frontier
 open models; a permissionless, global fleet of GPU miners serves the tokens. Every
 response carries a cryptographic commitment that the named model produced it, and
 weightless validators verify a sample and set weights on chain.
@@ -114,8 +111,3 @@ before they land.
 distributes. Validators run the audits themselves, the master role recedes,
 parameters settle. The trigger is operational, not calendar: stable settlement
 across epochs and a verification path reproducible outside our infrastructure.
-
----
-
-`api.engy.ai` · `github.com/hanlinai/engy` (validator + miner docs).
-Intelligence is the new energy. Part of the [hanlin.ai](https://hanlin.ai) lab.
