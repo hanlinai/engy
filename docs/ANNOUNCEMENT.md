@@ -52,7 +52,7 @@ What you do:
   while claiming the original is what gets caught.
 - **Attach a TOPLOC proof to every response.** That is what makes the inference
   verifiable. Miner setup and the proof contract are in
-  `github.com/hanlinai/engy/blob/main/docs/MINER.md`; the scoring-eligible
+  [docs/MINER.md](https://github.com/hanlinai/engy/blob/main/docs/MINER.md); the scoring-eligible
   reference miner code is being polished and released soon. The bare
   `engy-refminer` sends an empty commitment and is **not scoring-eligible**.
 - **Pass the qualification probe.** A new worker is probed before it receives
@@ -87,7 +87,7 @@ pulls the master-signed result from the provider API (no credential, no
 registration), audits it (verifies the sr25519 signature against the pinned master
 hotkey, resolves hotkeys to uids, renormalizes), and calls `set_weights` on netuid
 53. It checks and mirrors the master's weights on chain, nothing heavier. Full
-setup: `github.com/hanlinai/engy/blob/main/docs/VALIDATOR.md`.
+setup: [docs/VALIDATOR.md](https://github.com/hanlinai/engy/blob/main/docs/VALIDATOR.md).
 
 **What the audits mean.** Weights come from sampled two-phase proof audits: the
 nonce is revealed only after the master holds the commitment, so the challenge
