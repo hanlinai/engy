@@ -36,8 +36,6 @@ backed-up validator never touches a live buyer request. The capture ships for
 
 ## For miners
 
-**Registration is permissionless.** Register a hotkey on netuid 53 and connect.
-
 **At launch we open one model for mining: Qwen3.6-35B-A3B.** We start with the
 smallest launch model on purpose, to keep the entry bar low. It serves on any
 FP8-capable NVIDIA GPU (Ada, Hopper, or Blackwell) that fits the model's
@@ -47,12 +45,11 @@ B200**). More hardware, more throughput. GLM-5.2 stays 1st-party for now and ope
 to miners later.
 
 The miner is a small CPU-only **dial-out client**: it opens a WebSocket to the
-gateway and forwards requests to your own sglang or vLLM server. The gateway never
-connects to you, so there is **no inbound port**, and NAT and firewalls are not
-your problem.
+gateway and forwards requests to your own sglang server. The gateway never dials
+in, so there is **no inbound port**, and NAT and firewalls are not your problem.
 
 ```
-buyer → api.engy.ai → gateway → your miner → your sglang/vLLM → your GPUs
+buyer → api.engy.ai → gateway → your miner → your sglang serve → your GPUs
 ```
 
 What you do:
@@ -96,8 +93,8 @@ This is the only role that needs GPUs, and during stabilization engy runs it.
 pulls the master-signed result from the provider API (no credential, no
 registration), audits it (verifies the sr25519 signature against the pinned master
 hotkey, resolves hotkeys to uids, renormalizes), and calls `set_weights` on netuid
-53. It checks and mirrors the master's weights on chain, nothing heavier. Runbook:
-the light-validator section of the `hanlinai/engy` README.
+53. It checks and mirrors the master's weights on chain, nothing heavier. Full
+setup: `github.com/hanlinai/engy/blob/main/docs/VALIDATOR.md`.
 
 **What the audits mean.** Weights come from sampled two-phase proof audits: the
 nonce is revealed only after the master holds the commitment, so the challenge
