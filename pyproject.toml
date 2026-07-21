@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "engy-sn53"
-version = "0.3.1"
+version = "0.4.0"
 description = "engy Bittensor subnet 53 — light validator (and, later, the open miner)"
 requires-python = ">=3.11"
 # Upper bounds are deliberate. Validators auto-update from `:latest` within
@@ -13,12 +13,31 @@ requires-python = ">=3.11"
 # Raise these bounds intentionally, after the staging soak.
 dependencies = [
     "httpx>=0.27,<1",
-    "substrate-interface>=1.7,<2",
+    # Keypair (ss58 -> public key) and raw sr25519 verification. NOT
+    # substrate-interface: it pulls scalecodec, and once bittensor 10.5 moved
+    # to cyscale — which claims the same namespace — we became the last thing
+    # dragging scalecodec back in, recreating the very conflict the chain
+    # extra's bound exists to avoid. These two are already part of the
+    # bittensor stack, so the chain install gains nothing new.
+    "bittensor-wallet>=4.1,<5",
+    "py-sr25519-bindings>=0.2,<1",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0,<9"]
-chain = ["bittensor>=9.0,<10"]
+# bittensor 9.x is unusable against the current finney runtime, in two
+# independent ways. It pins scalecodec==1.2.12 while leaving
+# async-substrate-interface>=1.5.6 open at the top; asi 2.0 replaced scalecodec
+# with cyscale, which claims the same namespace, so a plain install resolves to
+# two packages that refuse to coexist and bittensor raises at import. Holding
+# asi below 2 avoids that but leaves a client too old to decode the runtime's
+# newtype-wrapped netuid, so metagraph() fails instead. 10.5 completed the
+# cyscale migration and bounds asi itself.
+#
+# Both failures land in the same place: the validator fetches and verifies
+# normally and can never reach the chain, logging `[chain] open failed` every
+# tick while the heartbeat keeps the container healthy.
+chain = ["bittensor>=10.5,<11"]
 
 [project.scripts]
 engy-sn53-validator = "validator.validator:main"

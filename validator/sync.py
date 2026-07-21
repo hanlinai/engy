@@ -79,7 +79,7 @@ def verify_payload(payload: dict, *, master_hotkey: str,
     sig = payload.get("signature", "")
     try:
         import sr25519
-        from substrateinterface import Keypair
+        from bittensor_wallet import Keypair
         pub = Keypair(ss58_address=master_hotkey).public_key
         raw_sig = bytes.fromhex(sig)
         # Verify against local_digest (recomputed), NOT payload["digest"] —

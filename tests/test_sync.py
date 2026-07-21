@@ -2,7 +2,7 @@ import hashlib
 import json
 
 import httpx
-from substrateinterface import Keypair
+from bittensor_wallet import Keypair
 
 from validator.sync import epoch_message, verify_payload, fetch_weights
 

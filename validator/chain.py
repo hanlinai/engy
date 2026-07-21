@@ -60,7 +60,7 @@ def _valid_block(b) -> int | None:
 def open_chain(*, network: str, netuid: int) -> ChainView:
     """Connect and read the metagraph and current block. Raises on failure."""
     import bittensor as bt
-    sub = bt.subtensor(network=network)
+    sub = bt.Subtensor(network=network)
     meta = sub.metagraph(netuid)
     return ChainView(sub=sub, hotkeys=list(meta.hotkeys), block=_read_block(sub))
 
@@ -115,7 +115,7 @@ def set_weights(view: ChainView, *, wallet: str, wallet_hotkey: str, netuid: int
     """Submit. False on any failure — the caller must not advance state."""
     try:
         import bittensor as bt
-        wal = bt.wallet(name=wallet, hotkey=wallet_hotkey)
+        wal = bt.Wallet(name=wallet, hotkey=wallet_hotkey)
         ok = view.sub.set_weights(wallet=wal, netuid=netuid, uids=uids, weights=ws,
                                   version_key=0, wait_for_inclusion=True)
         # newer SDKs return (bool, msg)
