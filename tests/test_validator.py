@@ -353,6 +353,8 @@ def test_healthcheck_exits_nonzero_on_a_stale_heartbeat(tmp_path, monkeypatch, c
     hb = tmp_path / "heartbeat.json"
     monkeypatch.setenv("ENGY_SN53_API", "https://engy.example")
     monkeypatch.setenv("ENGY_SN53_MASTER_HOTKEY", MASTER.ss58_address)
+    monkeypatch.setenv("ENGY_SN53_WALLET", "w")
+    monkeypatch.setenv("ENGY_SN53_WALLET_HOTKEY", "hk")
     monkeypatch.setenv("ENGY_SN53_HEARTBEAT_FILE", str(hb))
     monkeypatch.setenv("ENGY_SN53_POLL_S", "600")
 
@@ -480,6 +482,8 @@ def test_poll_default_leaves_room_under_the_resubmit_interval(monkeypatch):
     from validator.validator import load_config
     monkeypatch.setenv("ENGY_SN53_API", "https://engy.example")
     monkeypatch.setenv("ENGY_SN53_MASTER_HOTKEY", MASTER.ss58_address)
+    monkeypatch.setenv("ENGY_SN53_WALLET", "w")
+    monkeypatch.setenv("ENGY_SN53_WALLET_HOTKEY", "hk")
     monkeypatch.delenv("ENGY_SN53_POLL_S", raising=False)
     poll = load_config()["poll_s"]
     assert poll == 300
@@ -492,6 +496,8 @@ def test_resubmit_interval_is_overridable_for_a_higher_weights_rate_limit(tmp_pa
     from validator.validator import load_config
     monkeypatch.setenv("ENGY_SN53_API", "https://engy.example")
     monkeypatch.setenv("ENGY_SN53_MASTER_HOTKEY", MASTER.ss58_address)
+    monkeypatch.setenv("ENGY_SN53_WALLET", "w")
+    monkeypatch.setenv("ENGY_SN53_WALLET_HOTKEY", "hk")
     monkeypatch.setenv("ENGY_SN53_RESUBMIT_BLOCKS", "500")
     assert load_config()["resubmit_blocks"] == 500
 
@@ -555,3 +561,57 @@ def test_a_fully_unregistered_vector_names_its_likely_cause(tmp_path, capsys):
     assert fake.submitted == []
     out = capsys.readouterr().out
     assert "5Ghost" in out and "owner_hotkey" in out
+
+
+# ── configuration surface ────────────────────────────────────────
+
+def _clear_env(monkeypatch):
+    for k in ("ENGY_SN53_API", "ENGY_SN53_MASTER_HOTKEY", "ENGY_SN53_WALLET",
+              "ENGY_SN53_WALLET_HOTKEY", "ENGY_SN53_POLL_S",
+              "ENGY_SN53_RESUBMIT_BLOCKS", "ENGY_SN53_NETUID"):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_protocol_constants_need_no_configuration(monkeypatch):
+    # An operator should not have to know the provider URL or the master
+    # hotkey: both are protocol facts, identical for everyone on the subnet.
+    from validator.validator import DEFAULT_API, DEFAULT_MASTER_HOTKEY, load_config
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("ENGY_SN53_WALLET", "my-coldkey")
+    monkeypatch.setenv("ENGY_SN53_WALLET_HOTKEY", "my-hotkey")
+    cfg = load_config()
+    assert cfg["api"] == DEFAULT_API == "https://provider.engy.ai"
+    assert cfg["master_hotkey"] == DEFAULT_MASTER_HOTKEY
+    assert DEFAULT_MASTER_HOTKEY == "5DXSBCCKH5ENuyHFNaAvtaMfbhEEWpjSJB4rzc4mJfsc1uvJ"
+
+
+def test_the_wallet_is_the_only_thing_an_operator_must_supply(monkeypatch):
+    # Wallet names identify THIS operator's keys. Defaulting them would let a
+    # misconfigured validator sign with whatever wallet happens to be called
+    # "default" — a different key than intended, discovered on chain.
+    from validator.validator import load_config
+    _clear_env(monkeypatch)
+    with pytest.raises(SystemExit) as e:
+        load_config()
+    assert "ENGY_SN53_WALLET" in str(e.value)
+
+    monkeypatch.setenv("ENGY_SN53_WALLET", "my-coldkey")
+    with pytest.raises(SystemExit) as e:
+        load_config()
+    assert "ENGY_SN53_WALLET_HOTKEY" in str(e.value)
+
+    monkeypatch.setenv("ENGY_SN53_WALLET_HOTKEY", "my-hotkey")
+    cfg = load_config()
+    assert cfg["wallet"] == "my-coldkey" and cfg["wallet_hotkey"] == "my-hotkey"
+
+
+def test_the_protocol_defaults_stay_overridable_for_staging(monkeypatch):
+    from validator.validator import load_config
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("ENGY_SN53_WALLET", "w")
+    monkeypatch.setenv("ENGY_SN53_WALLET_HOTKEY", "hk")
+    monkeypatch.setenv("ENGY_SN53_API", "https://provider.teby.ai")
+    monkeypatch.setenv("ENGY_SN53_MASTER_HOTKEY", "5Staging")
+    cfg = load_config()
+    assert cfg["api"] == "https://provider.teby.ai"
+    assert cfg["master_hotkey"] == "5Staging"

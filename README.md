@@ -43,7 +43,7 @@ pulls new releases automatically, so a running validator stays current without
 manual intervention. Submission state lives in a named volume, so a restart
 resumes the resubmit schedule instead of starting the epoch over.
 
-    cp .env.validator.example .env.validator   # fill in the two required values
+    cp .env.validator.example .env.validator   # fill in your wallet names
     docker compose --env-file .env.validator -f docker/docker-compose.validator.yml up -d
     docker compose -f docker/docker-compose.validator.yml logs -f validator
 
@@ -65,10 +65,13 @@ production tracks); pushing to `main` publishes `:staging` for soak-testing via
 ### Without Docker
 
     pip install -e .[chain]
-    export ENGY_SN53_API=https://provider.engy.ai
-    export ENGY_SN53_MASTER_HOTKEY=<published master hotkey>
     export ENGY_SN53_WALLET=<your wallet> ENGY_SN53_WALLET_HOTKEY=<your hotkey>
     engy-sn53-validator
+
+Your wallet is the only thing you have to supply. The provider URL and the
+master hotkey are protocol constants with built-in defaults — override
+`ENGY_SN53_API` and `ENGY_SN53_MASTER_HOTKEY` together only to point at a
+non-production deployment.
 
 Every payload is verified before it touches the chain: the validator
 recomputes `sha256(result_json)` and checks it equals the payload's `digest`

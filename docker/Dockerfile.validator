@@ -37,11 +37,16 @@ COPY docker/entrypoint-validator.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # ── Environment defaults (override via --env-file .env.validator) ──
+# POLL_S must match load_config()'s default: it drives resubmit scheduling, so
+# an image default higher than the code's is not a harmless discrepancy — a
+# minimal .env.validator (only the two required vars) inherits it, halving the
+# polls per resubmit interval and raising the watchdog's stall limit from 900s
+# to 1800s without anything in the config saying so.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     ENGY_SN53_NETUID=53 \
     ENGY_SN53_NETWORK=finney \
-    ENGY_SN53_POLL_S=600 \
+    ENGY_SN53_POLL_S=300 \
     ENGY_SN53_STATE_FILE=/var/lib/engy-sn53/state.json \
     ENGY_SN53_HEARTBEAT_FILE=/var/lib/engy-sn53/heartbeat.json
 
