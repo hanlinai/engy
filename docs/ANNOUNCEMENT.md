@@ -61,9 +61,10 @@ What you do:
   `model_root` (architecture, weights, quantization). Serving a cheaper quant
   while claiming the original is what gets caught.
 - **Attach a TOPLOC proof to every response.** That is what makes the inference
-  verifiable. The scoring-eligible miner reference lives at
-  `github.com/hanlinai/engy/tree/main/miner`; the bare `engy-refminer` sends an
-  empty commitment and is **not scoring-eligible**.
+  verifiable. Miner setup and the proof contract are in
+  `github.com/hanlinai/engy/blob/main/docs/MINER.md`; the scoring-eligible
+  reference miner code is being polished and released soon. The bare
+  `engy-refminer` sends an empty commitment and is **not scoring-eligible**.
 - **Pass the qualification probe.** A new worker is probed before it receives
   buyer traffic, and stays routed only while it is healthy.
 
@@ -123,5 +124,5 @@ across epochs and a verification path reproducible outside our infrastructure.
 
 ---
 
-`api.engy.ai` · `github.com/hanlinai/engy` (validator + miner reference).
+`api.engy.ai` · `github.com/hanlinai/engy` (validator + miner docs).
 Intelligence is the new energy. Part of the [hanlin.ai](https://hanlin.ai) lab.
