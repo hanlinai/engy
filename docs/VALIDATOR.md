@@ -103,7 +103,12 @@ provider-side problem from one of yours — if an epoch has not finalized there,
 your validator having nothing new to submit is correct behaviour.
 
 Updates are automatic: Watchtower pulls new releases and recreates the
-container, which is safe mid-epoch. To manage that yourself, pin a release tag
+container, which is safe mid-epoch. Confirm it is actually running —
+`docker ps` showing it as `Restarting` means updates are not reaching you:
+
+```bash
+docker logs engy_sn53_watchtower --tail 5
+``` To manage that yourself, pin a release tag
 in the compose file and drop the watchtower service.
 
 ---
@@ -118,6 +123,7 @@ in the compose file and drop the watchtower service.
 | `[chain] set_weights failed (…)` | Rejected at the extrinsic: registration, permit, stake, or rate limit. |
 | `[chain] none of the payload's hotkeys are registered on chain` | Nothing to submit; last weights stand. Report it. |
 | `[chain] burn goes to X, expected owner Y` | Provider-side misconfiguration. Report it; keep running. |
+| watchtower: `client version 1.25 is too old` | Its Docker API version is not being forced. Check `DOCKER_API_VERSION=1.44` is set on the watchtower service — without it updates silently never happen and you stay on whatever image you started with. |
 | `[health] no completed tick in …` | It wedged and restarted itself. Repeatedly means something upstream hangs — usually a chain endpoint that accepts connections and never answers. |
 
 If state is corrupt, stop the container, remove the `engy_sn53_data` volume, and
