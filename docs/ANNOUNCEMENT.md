@@ -44,10 +44,6 @@ FP8-capable NVIDIA GPU (Ada, Hopper, or Blackwell) that fits the model's
 B200**). More hardware, more throughput. GLM-5.2 stays 1st-party for now and opens
 to miners later.
 
-The miner is a small CPU-only **dial-out client**: it opens a WebSocket to the
-gateway and forwards requests to your own sglang server. The gateway never dials
-in, so there is **no inbound port**, and NAT and firewalls are not your problem.
-
 ```
 buyer → api.engy.ai → gateway → your miner → your sglang serve → your GPUs
 ```
