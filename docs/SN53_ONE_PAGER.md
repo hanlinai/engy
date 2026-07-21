@@ -110,7 +110,7 @@ which is exactly the property a permissionless miner set needs.
                        └────────────────────────────────────┘
 ```
 
-Three principles drive the topology:
+Four principles drive the topology:
 
 - **Buyer-first.** Buyers see one OpenAI/Anthropic-compatible endpoint with
   prepaid billing and never see the subnet. Miners dial out to the gateway (no
@@ -128,6 +128,13 @@ Three principles drive the topology:
   throughput; an optional per-miner `priority` can bias toward a tier if an
   operator wants it. The detailed routing rules are in *How the gateway routes
   traffic* below.
+- **Zero data retention.** The gateway keeps no buyer content: prompts and
+  completions are relayed and never persisted (only metadata such as token
+  counts and status is logged), and even the verification tee (the TOPLOC proof,
+  which necessarily carries buyer tokens) lives only in expiring RAM and never
+  touches disk. Our **1st-party clusters run under the same zero-retention
+  policy**, so a request served on the 1st-party path is **ZDR-guaranteed end to
+  end** by construction.
 
 ---
 
@@ -191,59 +198,70 @@ nothing that epoch and recovers the next one.
 
 ## How the gateway routes traffic across 1st-party and subnet
 
-The goal: **hit our own SLA by admitting only qualified, healthy miners, then
-scale machine count by adding permissionless subnet GPUs that serve alongside the
-1st-party cluster.** Two mechanisms do this, both re-resolved every heartbeat.
+The goal: **hit our own SLA by admitting only proven, healthy miners, then scale
+throughput by letting permissionless subnet GPUs serve alongside the 1st-party
+cluster.** The gateway stays dumb and fast: it relays tokens and routes on one
+fact, whether a worker is cleared to serve. Deciding who is cleared belongs to the
+control plane, **engy-traffic**, which earns a new miner its place with **probe
+traffic** and **TOPLOC proof** before any buyer request reaches it.
 
-### Lever 1: the routable gate (who is *allowed* to serve)
+### Onboarding a new subnet miner
 
-The gateway routes by a **single DB fact** and does no SLA logic itself:
+A permissionless miner is a stranger, so it proves itself before it touches paid
+traffic. engy-traffic drives **synthetic probe traffic** at a newly connected
+worker: real requests it serves as if in production, but that no buyer sees and
+that can never earn on-chain weight. Two things must hold across that probe:
 
-| Worker | Routable when |
-|---|---|
-| **1st-party** (`type != subnet`) | **connected** (heartbeat-fresh); never gated |
-| **subnet** (`type == subnet` + hotkey) | `workers.status == 'active'` **and** heartbeat-fresh |
+- **It serves correctly.** High acceptance and latency inside the model's SLA.
+- **It serves the real model.** Every probe response carries a **TOPLOC proof**,
+  and the validator path confirms the activations came from the canonical
+  checkpoint, not a cheaper quant wearing its name.
 
-`'active'` is set by the control plane (**engy-traffic**) only when a subnet
-worker is connected **and qualified** (passed a probe: ≥99% HTTP and ≥99% TOPLOC
-pass, optional TTFT/TPOT ceilings) **and SLA-healthy**. The **circuit breaker**
-also lives in the control plane: it watches `request_log` for fast 502/504s (≥5
-failures **and** ≥50% in ~60s) and quarantines by flipping status off `'active'`.
-So a sick subnet miner is pulled from routing within about a minute, while the
-untrusted subnet can never dent SLA before it has earned `'active'`.
-
-### Lever 2: fair dispatch across eligible miners
-
-Among the eligible miners for a model, the gateway's dispatcher spreads buyer
-traffic **fairly**: a rendezvous hash on the prompt prefix (**affinity**) keeps
-repeated same-prefix requests on one miner so its radix/prefix cache stays warm,
-and everything else is **round-robin**. 1st-party and qualified subnet miners are
-peers here, so an active subnet miner receives the same share as a 1st-party
-worker. An optional per-miner `priority` lever can bias dispatch toward a tier
-(the dispatcher fills the highest live-priority tier before spilling to a lower
-one); at equal priority, the default, it reduces to the fair round-robin and
-affinity above.
+Clear both and the worker becomes **active**: the one state in which the gateway
+hands it real buyer traffic. Fall short and it never leaves the waiting room; the
+miner fixes its serve and re-onboards. This admission gate is what keeps an
+untrusted subnet from ever denting the SLA.
 
 ```
-buyer request
-      │
-      ▼
- eligible miners for this model
- (1st-party always; subnet iff status='active')
-      │
-      ▼
- any with a free slot?  ──no──▶  429 full  /  404 no_miner   (honest signal)
-      │ yes
-      ▼
- pick within the top live-priority tier:
- prefix affinity if the prompt repeats, else round-robin  ──▶  serve
+ new permissionless miner
+        │
+        ▼
+   probe traffic          served like production, but no buyer sees it
+        │                 and it earns no weight
+        ├── serves correctly?  (acceptance + latency inside the SLA)
+        └── TOPLOC proof?      (activations match the canonical model)
+        │
+     both hold
+        ▼
+     active  ─────▶  serves production traffic, equal peer of 1st-party
+        │
+   degrades / slows
+        ▼
+     pulled  ─────▶  must re-prove before it serves again
 ```
 
-1st-party and active subnet miners share buyer traffic equally, so we scale
-machine count with permissionless GPUs **without** letting an unqualified or flaky
-miner touch the SLA path: the admission gate, not a routing hierarchy, is what
-protects the SLA. And because trust is off the serve path, a slow validator or
-audit backlog never slows a single buyer request.
+### Staying active
+
+Qualification is not a one-time badge. engy-traffic keeps watching every active
+worker and pulls any that starts failing or slows below its SLA, within about a
+minute, then makes it re-prove itself before it serves again. Trust is earned
+continuously, and it is earned **off the buyer's path**: a slow or backed-up
+validator never slows a single production request.
+
+### Sharing the load
+
+Once active, a subnet miner is a **peer of the 1st-party cluster**, not a
+second-class fallback. The gateway spreads buyer traffic across all eligible
+miners evenly, with prompt-prefix affinity so a conversation stays on a
+cache-warm miner. Adding permissionless GPUs simply adds capacity: the same SLA,
+more machines serving it. An operator can still bias toward a tier when it wants
+to.
+
+Net: **the admission gate, not a routing hierarchy, protects the SLA.** A
+permissionless GPU touches paid traffic only after it has served probe traffic
+cleanly and proven via TOPLOC that it ran the canonical model, and it is pulled
+the moment it degrades. That is how we scale machine count with untrusted GPUs
+without ever putting the SLA at risk.
 
 ## References
 
