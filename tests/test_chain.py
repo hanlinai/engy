@@ -1,4 +1,6 @@
-from validator.chain import resolve_uids, skipped_hotkeys
+from validator.chain import (
+    ChainView, dropped_weight_share, resolve_uids, skipped_hotkeys, _valid_block,
+)
 
 
 def test_maps_hotkeys_to_uids_in_uid_order():
@@ -28,3 +30,45 @@ def test_skipped_hotkeys_lists_unregistered_in_payload_order():
 
 def test_skipped_hotkeys_empty_when_all_registered():
     assert skipped_hotkeys([["5A", 10], ["5B", 20]], ["5A", "5B"]) == []
+
+
+def test_dropped_weight_share_is_by_weight_not_by_count():
+    # Ten zero-weight strangers matter far less than one heavy one.
+    weights = [["5Aaa", 60000], ["5Gone", 5535]]
+    assert dropped_weight_share(weights, ["5Aaa"]) == 5535 / 65535
+
+
+def test_dropped_weight_share_is_zero_when_everyone_is_registered():
+    assert dropped_weight_share([["5Aaa", 65535]], ["5Aaa", "5Bbb"]) == 0.0
+
+
+def test_dropped_weight_share_is_one_when_nobody_is_registered():
+    assert dropped_weight_share([["5Aaa", 65535]], ["5Zzz"]) == 1.0
+
+
+def test_dropped_weight_share_of_an_all_zero_vector_does_not_divide_by_zero():
+    assert dropped_weight_share([["5Aaa", 0], ["5Bbb", 0]], []) == 0.0
+
+
+def test_dropped_weight_share_of_an_empty_vector_is_zero():
+    assert dropped_weight_share([], ["5Aaa"]) == 0.0
+
+
+def test_a_burn_vector_resolves_to_the_owner_alone():
+    # Burn arrives as an ordinary single row; no special-casing anywhere.
+    uids, ws = resolve_uids([["5Owner", 65535]], ["5Aaa", "5Owner", "5Bbb"])
+    assert (uids, ws) == ([1], [65535])
+    assert dropped_weight_share([["5Owner", 65535]], ["5Aaa", "5Owner"]) == 0.0
+
+
+def test_chain_view_carries_a_possibly_absent_block_number():
+    v = ChainView(sub=object(), hotkeys=["5Aaa"], block=None)
+    assert v.block is None and v.hotkeys == ["5Aaa"]
+
+
+def test_only_positive_ints_count_as_a_block_number():
+    # A bad RPC reply must degrade to the wall-clock fallback, not poison
+    # the block arithmetic.
+    assert _valid_block(4823910) == 4823910
+    for bad in (None, 0, -1, True, False, 1.5, "4823910"):
+        assert _valid_block(bad) is None, bad

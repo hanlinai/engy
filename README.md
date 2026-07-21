@@ -29,15 +29,19 @@ follow.
 
 The light validator syncs the master-signed epoch result from the engy
 provider API,
-verifies the signature against the pinned master hotkey, and submits the same
-weight vector on chain. CPU-only; no GPU, no database.
+verifies the signature against the pinned master hotkey, and submits that
+weight vector on chain, resubmitting it roughly every 100 blocks for the rest
+of the epoch. The chain treats a validator that has not submitted within
+`activity_cutoff` as inactive and drops its weights from consensus, so a
+once-per-epoch submission would leave the validator earning nothing for most
+of the week. CPU-only; no GPU, no database.
 
 ### With Docker (recommended, auto-updating)
 
 The container tracks a GHCR image and [Watchtower](https://containrrr.dev/watchtower/)
 pulls new releases automatically, so a running validator stays current without
-manual intervention. `last_applied` lives in a named volume, so an update
-never re-submits an already-applied epoch.
+manual intervention. Submission state lives in a named volume, so a restart
+resumes the resubmit schedule instead of starting the epoch over.
 
     cp .env.validator.example .env.validator   # fill in the two required values
     docker compose --env-file .env.validator -f docker/docker-compose.validator.yml up -d

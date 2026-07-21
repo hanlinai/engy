@@ -29,7 +29,7 @@ COPY validator/ validator/
 
 RUN pip install --no-cache-dir -e ".[chain]"
 
-# ── Persistent state dir (last_applied survives auto-update restarts) ──
+# ── Persistent state dir (submission state survives auto-update restarts) ──
 RUN mkdir -p /var/lib/engy-sn53
 
 # ── Entrypoint ──────────────────────────────────────────────────
