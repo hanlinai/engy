@@ -31,20 +31,33 @@ from .state import (
 from .sync import fetch_weights, verify_payload
 
 
+# Protocol constants: identical for everyone on the subnet, so an operator
+# should not have to know them. Both stay overridable — staging points at its
+# own provider with its own master key — but set them as a pair: the master
+# hotkey only signs for the provider that holds it, and a mismatch rejects
+# every payload.
+DEFAULT_API = "https://provider.engy.ai"
+DEFAULT_MASTER_HOTKEY = "5DXSBCCKH5ENuyHFNaAvtaMfbhEEWpjSJB4rzc4mJfsc1uvJ"
+
+
 def load_config() -> dict:
     env = os.environ
-    for req in ("ENGY_SN53_API", "ENGY_SN53_MASTER_HOTKEY"):
+    # The wallet is the one thing that is genuinely this operator's. Defaulting
+    # it to bittensor's "default" naming would let a misconfigured validator
+    # sign with whatever wallet happens to carry that name — a different key
+    # than intended, discovered only from on-chain behaviour.
+    for req in ("ENGY_SN53_WALLET", "ENGY_SN53_WALLET_HOTKEY"):
         if not env.get(req):
-            sys.exit(f"{req} is required")
+            sys.exit(f"{req} is required (your bittensor wallet/hotkey name)")
     state_file = env.get("ENGY_SN53_STATE_FILE",
                          os.path.expanduser("~/.engy-sn53/state.json"))
     return {
-        "api": env["ENGY_SN53_API"],
-        "master_hotkey": env["ENGY_SN53_MASTER_HOTKEY"],
+        "api": env.get("ENGY_SN53_API") or DEFAULT_API,
+        "master_hotkey": env.get("ENGY_SN53_MASTER_HOTKEY") or DEFAULT_MASTER_HOTKEY,
         "netuid": int(env.get("ENGY_SN53_NETUID", "53")),
         "network": env.get("ENGY_SN53_NETWORK", "finney"),
-        "wallet": env.get("ENGY_SN53_WALLET", "default"),
-        "wallet_hotkey": env.get("ENGY_SN53_WALLET_HOTKEY", "default"),
+        "wallet": env["ENGY_SN53_WALLET"],
+        "wallet_hotkey": env["ENGY_SN53_WALLET_HOTKEY"],
         "poll_s": int(env.get("ENGY_SN53_POLL_S", "300")),
         "resubmit_blocks": int(env.get("ENGY_SN53_RESUBMIT_BLOCKS",
                                        str(RESUBMIT_BLOCKS))),
