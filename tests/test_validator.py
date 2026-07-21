@@ -7,6 +7,7 @@ import pytest
 from substrateinterface import Keypair
 
 from validator import chain as chain_mod
+from validator.chain import EXPECTED_OWNER_HOTKEY
 from validator.state import (
     read_state, last_applied, last_submit_block, cached_weights,
 )
@@ -504,3 +505,53 @@ def test_resubmit_interval_is_overridable_for_a_higher_weights_rate_limit(tmp_pa
     fake.block = BASE_BLOCK + 500
     assert tick(cfg, now=NOW + 6000, client=_client(_payload()),
                 chain=fake) == "resubmitted"
+
+
+# ── burn target tripwire ─────────────────────────────────────────
+
+def test_an_unexpected_burn_target_warns_but_still_submits(tmp_path, capsys):
+    # A tripwire for provider misconfiguration, not a gate. Blocking here
+    # would take every third-party validator offline the moment subnet
+    # ownership legitimately changed hands.
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(hotkeys=["5Stranger"])
+    client = httpx.Client(transport=httpx.MockTransport(
+        lambda req: httpx.Response(200, json=_payload_with([["5Stranger", 65535]]))))
+    assert tick(cfg, now=NOW, client=client, chain=fake) == "applied"
+    assert fake.submitted == [([0], [65535])]
+    out = capsys.readouterr().out
+    assert "5Stranger" in out and "owner" in out.lower()
+
+
+def test_the_expected_burn_target_is_not_flagged(tmp_path, capsys):
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(hotkeys=[EXPECTED_OWNER_HOTKEY])
+    client = httpx.Client(transport=httpx.MockTransport(
+        lambda req: httpx.Response(200, json=_payload_with(
+            [[EXPECTED_OWNER_HOTKEY, 65535]]))))
+    assert tick(cfg, now=NOW, client=client, chain=fake) == "applied"
+    assert "unexpected" not in capsys.readouterr().out.lower()
+
+
+def test_a_real_distribution_is_never_flagged_as_a_burn(tmp_path, capsys):
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(hotkeys=["5A", "5B"])
+    client = httpx.Client(transport=httpx.MockTransport(
+        lambda req: httpx.Response(200, json=_payload_with(
+            [["5A", 40000], ["5B", 25535]]))))
+    assert tick(cfg, now=NOW, client=client, chain=fake) == "applied"
+    assert "owner" not in capsys.readouterr().out.lower()
+
+
+def test_a_fully_unregistered_vector_names_its_likely_cause(tmp_path, capsys):
+    # The failure a misconfigured owner_hotkey actually produces: the burn
+    # target is not on chain, resolve_uids drops it, and nothing is submitted.
+    # This used to be indistinguishable from a chain error in the logs.
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(hotkeys=["5SomeoneElse"])
+    client = httpx.Client(transport=httpx.MockTransport(
+        lambda req: httpx.Response(200, json=_payload_with([["5Ghost", 65535]]))))
+    assert tick(cfg, now=NOW, client=client, chain=fake) == "submit-failed"
+    assert fake.submitted == []
+    out = capsys.readouterr().out
+    assert "5Ghost" in out and "owner_hotkey" in out

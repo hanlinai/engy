@@ -13,6 +13,26 @@ from dataclasses import dataclass
 
 U16 = 65535
 
+# netuid 53's on-chain SubnetOwnerHotkey (uid 161) — where a burn should pay
+# out. A tripwire for a misconfigured owner_hotkey on the provider, which
+# otherwise fails silently: a burn to an unregistered hotkey resolves to no
+# uid, so the validator submits nothing and just looks idle.
+#
+# Warns, never rejects — a blocking check would take every third-party
+# validator offline the moment subnet ownership legitimately changed hands.
+EXPECTED_OWNER_HOTKEY = "5F2HTUqtk9VWQwXkkUX9oFSXUkAib74qw7s3W7KyZP88AmYe"
+
+
+def burn_target(weights: list[list]) -> str | None:
+    """The sole recipient when this vector is a burn, else None.
+
+    A burn is one hotkey holding all the weight (the provider emits
+    `[[owner, 65535]]` when an epoch has no billed traffic). Zero-weight rows
+    are ignored — a vector can carry scored-but-zero miners alongside it.
+    """
+    nonzero = [hk for hk, w in weights if w > 0]
+    return nonzero[0] if len(nonzero) == 1 else None
+
 
 @dataclass
 class ChainView:
