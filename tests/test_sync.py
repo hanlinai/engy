@@ -46,7 +46,7 @@ def payload(*, result_json=None, digest=None, signature=None, **over):
 
 def verify(p, **over):
     kw = dict(master_hotkey=MASTER.ss58_address, netuid=NETUID,
-              genesis=GENESIS, now=NOW, last_applied=None)
+              genesis=GENESIS, now=NOW)
     kw.update(over)
     return verify_payload(p, **kw)
 
@@ -57,9 +57,8 @@ def test_epoch_math_matches_spec_example():
 
 
 def test_accepts_a_genuine_fresh_payload():
-    ok, reason, weights = verify(payload())
-    assert ok, reason
-    assert weights == [["5Aaa", 65535]]
+    ok, reason, weights, idx = verify(payload())
+    assert (ok, reason, weights, idx) == (True, "ok", [["5Aaa", 65535]], IDX)
 
 
 def test_evil_top_level_weights_are_ignored_verified_weights_come_from_result_json():
@@ -69,9 +68,9 @@ def test_evil_top_level_weights_are_ignored_verified_weights_come_from_result_js
     # actually returned for submission must come from result_json, NOT the
     # tampered top-level field.
     p = payload(weights=[["5Evil", 65535]])
-    ok, reason, weights = verify(p)
+    ok, reason, weights, idx = verify(p)
     assert ok, reason
-    assert weights == [["5Aaa", 65535]]
+    assert weights == [["5Aaa", 65535]] and idx == IDX
     assert weights != p["weights"]
 
 
@@ -79,7 +78,7 @@ def test_tampered_result_json_with_stale_digest_is_rejected():
     genuine = payload()
     tampered_rj = genuine["result_json"][:-1] + ("1" if genuine["result_json"][-1] != "1" else "2")
     p = dict(genuine, result_json=tampered_rj)  # digest/signature left as-is (old)
-    assert verify(p) == (False, "digest", None)
+    assert verify(p) == (False, "digest", None, None)
 
 
 def test_result_json_with_mismatched_epoch_index_is_malformed():
@@ -87,7 +86,7 @@ def test_result_json_with_mismatched_epoch_index_is_malformed():
     digest = hashlib.sha256(rj.encode("utf-8")).hexdigest()
     sig = MASTER.sign(epoch_message(NETUID, IDX, digest).encode()).hex()
     p = payload(result_json=rj, digest=digest, signature=sig)
-    assert verify(p) == (False, "malformed", None)
+    assert verify(p) == (False, "malformed", None, None)
 
 
 def test_result_json_with_mismatched_netuid_is_malformed():
@@ -95,23 +94,23 @@ def test_result_json_with_mismatched_netuid_is_malformed():
     digest = hashlib.sha256(rj.encode("utf-8")).hexdigest()
     sig = MASTER.sign(epoch_message(NETUID, IDX, digest).encode()).hex()
     p = payload(result_json=rj, digest=digest, signature=sig)
-    assert verify(p) == (False, "malformed", None)
+    assert verify(p) == (False, "malformed", None, None)
 
 
 def test_missing_result_json_is_malformed():
     p = payload()
     del p["result_json"]
-    assert verify(p) == (False, "malformed", None)
+    assert verify(p) == (False, "malformed", None, None)
 
 
 def test_non_string_result_json_is_malformed():
     p = payload()
     p["result_json"] = 12345
-    assert verify(p) == (False, "malformed", None)
+    assert verify(p) == (False, "malformed", None, None)
 
 
 def test_rejects_bad_signature():
-    assert verify(payload(signature="00" * 64)) == (False, "signature", None)
+    assert verify(payload(signature="00" * 64)) == (False, "signature", None, None)
 
 
 def test_rejects_wrong_master_key():
@@ -121,7 +120,7 @@ def test_rejects_wrong_master_key():
     p = payload(signed_hotkey=other.ss58_address,
                 signature=other.sign(epoch_message(NETUID, IDX, digest).encode()).hex())
     # signed_hotkey in the payload is irrelevant — only the pinned key counts
-    assert verify(p) == (False, "signature", None)
+    assert verify(p) == (False, "signature", None, None)
 
 
 def test_rejects_wrong_netuid_and_version():
@@ -136,21 +135,15 @@ def test_rejects_stale_epoch():
     digest = hashlib.sha256(rj.encode("utf-8")).hexdigest()
     p = payload(epoch_index=old, result_json=rj, digest=digest,
                 signature=MASTER.sign(epoch_message(NETUID, old, digest).encode()).hex())
-    assert verify(p) == (False, "stale-epoch", None)
-
-
-def test_rejects_already_applied():
-    assert verify(payload(), last_applied=12) == (False, "already-applied", None)
-    ok, reason, weights = verify(payload(), last_applied=11)
-    assert ok, reason
+    assert verify(p) == (False, "stale-epoch", None, None)
 
 
 def test_rejects_malformed_signature_non_hex():
-    assert verify(payload(signature="zz")) == (False, "signature", None)
+    assert verify(payload(signature="zz")) == (False, "signature", None, None)
 
 
 def test_rejects_malformed_signature_wrong_length():
-    assert verify(payload(signature="00")) == (False, "signature", None)
+    assert verify(payload(signature="00")) == (False, "signature", None, None)
 
 
 def test_fetch_weights_hits_the_v1_route():
@@ -168,9 +161,10 @@ def test_fetch_weights_hits_the_v1_route():
 
 def test_non_dict_payload_is_malformed():
     for bad in ([1, 2, 3], "nope", 5, None):
-        ok, reason, weights = verify_payload(bad, master_hotkey=MASTER.ss58_address, netuid=NETUID,
-                                    genesis=GENESIS, now=NOW, last_applied=None)
-        assert ok is False and reason == "malformed" and weights is None
+        ok, reason, weights, idx = verify_payload(
+            bad, master_hotkey=MASTER.ss58_address, netuid=NETUID,
+            genesis=GENESIS, now=NOW)
+        assert ok is False and reason == "malformed" and weights is None and idx is None
 
 
 def test_rejects_bytes_wrapped_signature():
@@ -183,7 +177,7 @@ def test_rejects_bytes_wrapped_signature():
     msg = epoch_message(NETUID, IDX, digest)
     wrapped = b"<Bytes>" + msg.encode() + b"</Bytes>"
     sig = MASTER.sign(wrapped).hex()
-    assert verify(payload(signature=sig)) == (False, "signature", None)
+    assert verify(payload(signature=sig)) == (False, "signature", None, None)
 
 
 def test_rejects_bool_epoch_index():
@@ -198,7 +192,7 @@ def test_rejects_missing_weights_in_result_json():
     digest = hashlib.sha256(rj.encode("utf-8")).hexdigest()
     sig = MASTER.sign(epoch_message(NETUID, IDX, digest).encode()).hex()
     p = payload(result_json=rj, digest=digest, signature=sig)
-    assert verify(p) == (False, "malformed", None)
+    assert verify(p) == (False, "malformed", None, None)
 
 
 def test_rejects_non_list_weights_in_result_json():
@@ -206,7 +200,7 @@ def test_rejects_non_list_weights_in_result_json():
     digest = hashlib.sha256(rj.encode("utf-8")).hexdigest()
     sig = MASTER.sign(epoch_message(NETUID, IDX, digest).encode()).hex()
     p = payload(result_json=rj, digest=digest, signature=sig)
-    assert verify(p) == (False, "malformed", None)
+    assert verify(p) == (False, "malformed", None, None)
 
 
 def test_rejects_weights_with_non_pair_entry_in_result_json():
@@ -214,7 +208,7 @@ def test_rejects_weights_with_non_pair_entry_in_result_json():
     digest = hashlib.sha256(rj.encode("utf-8")).hexdigest()
     sig = MASTER.sign(epoch_message(NETUID, IDX, digest).encode()).hex()
     p = payload(result_json=rj, digest=digest, signature=sig)
-    assert verify(p) == (False, "malformed", None)
+    assert verify(p) == (False, "malformed", None, None)
 
 
 def test_rejects_weights_with_out_of_range_value_in_result_json():
@@ -222,7 +216,7 @@ def test_rejects_weights_with_out_of_range_value_in_result_json():
     digest = hashlib.sha256(rj.encode("utf-8")).hexdigest()
     sig = MASTER.sign(epoch_message(NETUID, IDX, digest).encode()).hex()
     p = payload(result_json=rj, digest=digest, signature=sig)
-    assert verify(p) == (False, "malformed", None)
+    assert verify(p) == (False, "malformed", None, None)
 
 
 def test_accepts_well_formed_weights():
@@ -230,6 +224,15 @@ def test_accepts_well_formed_weights():
     digest = hashlib.sha256(rj.encode("utf-8")).hexdigest()
     sig = MASTER.sign(epoch_message(NETUID, IDX, digest).encode()).hex()
     p = payload(result_json=rj, digest=digest, signature=sig)
-    ok, reason, weights = verify(p)
+    ok, reason, weights, idx = verify(p)
     assert ok, reason
-    assert weights == [["5Aaa", 0], ["5Bbb", 65535]]
+    assert weights == [["5Aaa", 0], ["5Bbb", 65535]] and idx == IDX
+
+
+def test_verify_payload_no_longer_takes_last_applied():
+    # Scheduling moved out of verification: an epoch already on chain still
+    # verifies, because deciding whether to resubmit is the tick's job now.
+    import inspect
+    assert "last_applied" not in inspect.signature(verify_payload).parameters
+    ok, _, _, idx = verify(payload())
+    assert ok and idx == IDX
