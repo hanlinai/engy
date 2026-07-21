@@ -142,7 +142,7 @@ Four principles drive the topology:
 
 Settlement is per **(miner, model)** pair, integer-only fixed-point
 (floating-point results are not reproducible across validator implementations, so
-any arithmetic change is a consensus change). Epochs are **weekly** in prod (4h on
+any arithmetic change is a consensus change). Epochs are **daily** in prod (4h on
 staging), scored fresh from that epoch's slice of the request log.
 
 **Per-(miner, model) score:**
