@@ -13,20 +13,25 @@ from dataclasses import dataclass
 
 U16 = 65535
 
-# The provider's configured owner_hotkey — where a burn pays out. Registered
-# on netuid 53 at uid 229. Note this is deliberately NOT the chain's
-# SubnetOwnerHotkey (5F2HTUq…, uid 161); it is the same key as the master
-# hotkey that signs epoch results.
+# netuid 53's SubnetOwnerHotkey (uid 161) — where a burn is supposed to pay
+# out. Deliberately NOT the master hotkey that signs epoch results
+# (5DXSBCC…, uid 229): signing and receiving are separate jobs held by
+# separate keys, and a burn landing on the signing key pays the wrong account.
 #
 # A tripwire for a misconfigured owner_hotkey on the provider, which otherwise
-# fails silently: a burn to an unregistered hotkey resolves to no uid, so the
-# validator submits nothing and just looks idle.
+# fails silently in either direction: a burn to an unregistered hotkey
+# resolves to no uid, so the validator submits nothing and just looks idle,
+# while a burn to a registered-but-wrong hotkey lands and pays out normally
+# with nothing at all to show that it went to the wrong place.
 #
-# Warns, never rejects. v0.2.0 shipped the chain's SubnetOwnerHotkey here,
-# inferred from chain state rather than confirmed against the provider's
-# config — wrong, and a blocking check would have made that guess take every
-# third-party validator offline on the first burn.
-EXPECTED_OWNER_HOTKEY = "5DXSBCCKH5ENuyHFNaAvtaMfbhEEWpjSJB4rzc4mJfsc1uvJ"
+# Warns, never rejects — a blocking check would take every third-party
+# validator offline the moment subnet ownership legitimately changed hands.
+#
+# 0.2.1 set this to the signing key because that is what the provider was
+# observed emitting. That inverted the check: the constant was moved to agree
+# with the misconfiguration instead of flagging it, so the tripwire could
+# never fire. The provider's owner_hotkey is the thing that is wrong.
+EXPECTED_OWNER_HOTKEY = "5F2HTUqtk9VWQwXkkUX9oFSXUkAib74qw7s3W7KyZP88AmYe"
 
 
 def burn_target(weights: list[list]) -> str | None:
