@@ -27,31 +27,31 @@ endpoint and no extra hops.
    activations.
 3. The completion plus the proof go back over the same websocket connection.
 
-
 ### Files
 
 | file | what |
 |---|---|
-| `miner/engy_miner.py` | the miner: dials the gateway, tokenizes, drives the serve, reads the response, builds + returns the proof |
-| `miner/requirements.txt` | miner deps (incl. `transformers` — the miner tokenizes) |
+| `miner/engy_miner.py` | the whole miner in one module: dials the gateway, tokenizes, drives the serve, reads the response, builds + returns the proof |
+
 
 ---
 
 ## 2. Install
 
-Plan for ~5 minutes plus model load time. In the Python env that runs your sglang
-serve:
+Plan for ~5 minutes plus model load time. 
 
 ```bash
-pip install "sglang>=0.4.6"               # the model server
-pip install -r miner/requirements.txt     # the miner's deps
+pip install "sglang>=0.4.6"                                   # the model server
+pip install toploc transformers torch numpy requests websockets   # the miner's deps
 ```
+
+Then copy **`miner/engy_miner.py`** to the node — that one file is the miner.
 
 Put the **model checkpoint** on local disk (e.g.
 `/data/models/Qwen/Qwen3.6-35B-A3B-FP8`) — the miner loads its tokenizer from
 there.
 
-Then get a **miner key**. The gateway only admits registered miners; keep the key
+Then get a **miner key** from **[provider.engy.ai](https://provider.engy.ai)**. The gateway only admits registered miners; keep the key
 secret — it identifies this miner.
 
 ---
@@ -73,7 +73,7 @@ python -m sglang.launch_server \
   --tp-size 4 --trust-remote-code \
   --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.83 \
   --chunked-prefill-size 8192 \
-  --max-running-requests 1 --context-length 262144 \
+  --max-running-requests 8 --context-length 262144 \
   --enable-return-hidden-states \
   --host 0.0.0.0 --port 8000
 ```
@@ -90,6 +90,19 @@ curl -s http://127.0.0.1:8000/get_model_info >/dev/null && echo "serve up"
 
 Point it at your serve and checkpoint and give it your key. On connect it opens N
 websocket legs and sends a HELLO — that connect+admit **is** the register.
+
+```bash
+GW=wss://<gateway-host>/gw MINER_KEY=<your-key> MODEL=qwen3.6-35b-a3b \
+MAX_INFLIGHT=<serve concurrency> \
+python miner/engy_miner.py \
+    --checkpoint /data/models/Qwen/Qwen3.6-35B-A3B-FP8 \
+    --serve-url  http://127.0.0.1:8000
+```
+
+`--serve-url` takes one URL, or several comma-separated (the miner
+least-in-flight balances across them).
+
+The gateway-host is `api.engy.ai`.
 
 **The only capacity a miner declares is `MAX_INFLIGHT` — how many requests it can
 run at once.** The request *shape* limits (max input tokens, max output tokens,
@@ -123,3 +136,6 @@ serving the model:
 | `toploc_k` | `128` | proof top-k |
 | `toploc_v` | `40` | mismatch threshold |
 | `toploc_p` | `0.99` | pass ratio required |
+
+So this model needs `--context-length 262144` (224K + 32K). The miner already
+matches the 1800 s deadline by default — you do not have to set a timeout.
