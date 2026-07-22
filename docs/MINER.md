@@ -74,9 +74,15 @@ python -m sglang.launch_server \
   --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.83 \
   --chunked-prefill-size 8192 \
   --max-running-requests 8 --context-length 262144 \
-  --enable-return-hidden-states \
+  --enable-return-hidden-states --enable-cache-report \
   --host 0.0.0.0 --port 8000
 ```
+
+`--enable-cache-report` turns on cached-token accounting. The miner passes the
+count on to the gateway as `usage.prompt_tokens_details.cached_tokens`, which is
+what the gateway bills a prefix-cache read at its discounted rate — so leaving it
+off does not break anything, it just charges your buyers full price for prompt
+prefixes the serve never recomputed.
 
 Wait until it answers:
 
@@ -105,9 +111,11 @@ least-in-flight balances across them).
 The gateway-host is `api.engy.ai`.
 
 **The only capacity a miner declares is `MAX_INFLIGHT` — how many requests it can
-run at once.** The request *shape* limits (max input tokens, max output tokens,
-request timeout) are **the model's spec**, held by the gateway in `public.models`
-and applied to every miner serving that model.
+run at once.** It is a *total*: the miner splits it across the legs it opens and
+also sends it undivided, so the gateway records your real concurrency instead of
+inferring it from one leg's share. The request *shape* limits (max input tokens,
+max output tokens, request timeout) are **the model's spec**, held by the gateway
+in `public.models` and applied to every miner serving that model.
 
 | env | set to | note |
 |---|---|---|

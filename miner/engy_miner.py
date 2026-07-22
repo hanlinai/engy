@@ -129,7 +129,15 @@ HEARTBEAT_INTERVAL = 30.0                              # must stay < the gateway
 # Capacity advertised to the gateway (it only routes to miners with capacity and
 # waits up to max_request_s for the reply). max_inflight is split across the legs;
 # when it is smaller than the leg count we open fewer legs instead (see _leg_plan).
-CAP = {"max_inflight": int(os.environ.get("MAX_INFLIGHT", "64")),
+# MAX_INFLIGHT is the miner's TOTAL concurrency, and max_inflight_total carries
+# it to the gateway undivided on every leg: the gateway routes on the per-leg
+# share but records the total on the worker (and sizes its onboarding probe
+# against it). It cannot invert a share back into the total -- that needs the leg
+# count -- so it falls back to share x its own leg constant when the field is
+# missing, which registers a 1-inflight miner (one leg at 1) as 8.
+_MAX_INFLIGHT = int(os.environ.get("MAX_INFLIGHT", "64"))
+CAP = {"max_inflight": _MAX_INFLIGHT,
+       "max_inflight_total": _MAX_INFLIGHT,
        "max_input_tokens": int(os.environ.get("MAX_INPUT_TOKENS", "229376")),   # 224*1024
        "max_output_tokens": OUT_MAX,
        "max_request_s": float(os.environ.get("MAX_REQUEST_S", "1800.0"))}
@@ -495,15 +503,24 @@ def _gen_once(serve, input_ids, max_new, emit=None, skip_first_token=False, job=
     fin, offset = _fin_rows(meta["hidden_states"])
     oids = [int(t[1]) for t in (meta.get("output_token_logprobs") or [])]
     ftype = ((meta.get("finish_reason") or {}) or {}).get("type")
-    return oids, fin, offset, ftype
+    # cached_tokens = the prefix of this call's prompt served from the radix
+    # cache. /generate reports it unconditionally (unlike the OpenAI routes, which
+    # need --enable-cache-report); a serve too old to send it reports 0.
+    cached = int(meta.get("cached_tokens") or 0)
+    return oids, fin, offset, ftype, cached
 
 
 def _generate_chunked(serve, prompt_ids, max_new, emit=None, job=None):
     """Generate up to max_new tokens in GEN_CHUNK-sized serve calls, collecting the
     per-token final hidden states in order. Returns (all_oids, rows_list,
-    prompt_extra): all_oids = proven output tokens; rows_list = one np hidden row
-    per proven token; prompt_extra = tokens folded into the prompt on chunk 1
-    (only when the prompt was already radix-cached, rare).
+    prompt_extra, cached): all_oids = proven output tokens; rows_list = one np
+    hidden row per proven token; prompt_extra = tokens folded into the prompt on
+    chunk 1 (only when the prompt was already radix-cached, rare); cached = how
+    much of the BUYER's prompt came from the radix cache.
+
+    cached is read from chunk 1 only. Every continuation re-sends the prompt plus
+    the tokens so far and so is cached almost end to end; summing those would
+    bill the buyer a cache hit for the miner's own chunking.
 
     Continuations overlap by one token (drop the last, regenerate it greedily) so
     every KEPT row is a decode vector — never the prefill-block fin, which a full
@@ -512,14 +529,16 @@ def _generate_chunked(serve, prompt_ids, max_new, emit=None, job=None):
     all_oids: list = []
     rows_list: list = []
     prompt_extra: list = []
+    cached = 0
     while len(all_oids) < max_new:
         if job is not None:
             job.check()              # never START a chunk for a departed buyer
         want = min(GEN_CHUNK, max_new - len(all_oids))
         if not all_oids:
             # first chunk: input = prompt; keep the prefill fin + decode rows
-            oids, fin, offset, ftype = _gen_once(serve, prompt_ids, want, emit, job=job)
-            if offset:                           # prompt already cached -> fold skipped ids in
+            oids, fin, offset, ftype, cached = _gen_once(serve, prompt_ids, want,
+                                                         emit, job=job)
+            if offset:                         # prompt already cached -> fold skipped ids in
                 prompt_extra = oids[:offset]
                 oids = oids[offset:]
             nkeep = min(int(fin.shape[0]), len(oids))
@@ -529,8 +548,8 @@ def _generate_chunked(serve, prompt_ids, max_new, emit=None, job=None):
         else:
             # continuation: overlap by one so kept rows are all decode vectors
             inp = prompt_ids + prompt_extra + all_oids[:-1]
-            oids, fin, offset, ftype = _gen_once(serve, inp, want + 1, emit,
-                                                 skip_first_token=True, job=job)
+            oids, fin, offset, ftype, _ = _gen_once(serve, inp, want + 1, emit,
+                                                    skip_first_token=True, job=job)
             start = max(0, 1 - offset)           # row index where the NEW tokens begin
             avail = int(fin.shape[0]) - start
             kept = oids[1:1 + avail]              # skip index 0 (the regenerated dup)
@@ -539,7 +558,7 @@ def _generate_chunked(serve, prompt_ids, max_new, emit=None, job=None):
             produced = len(kept)
         if ftype != "length" or produced < want:   # EOS / short -> generation ended
             break
-    return all_oids, rows_list, prompt_extra
+    return all_oids, rows_list, prompt_extra, cached
 
 
 def _build_commitment(prompt_full, all_oids, rows_list):
@@ -572,8 +591,8 @@ def _process(request: dict, emit=None, job=None):
     if job is not None:
         job.serve = serve            # _on_cancel needs this to address the abort
     try:
-        all_oids, rows_list, prompt_extra = _generate_chunked(serve, prompt_ids,
-                                                              max_new, emit, job)
+        all_oids, rows_list, prompt_extra, cached = _generate_chunked(
+            serve, prompt_ids, max_new, emit, job)
     finally:
         _release_serve(serve)
 
@@ -581,10 +600,17 @@ def _process(request: dict, emit=None, job=None):
     commitment = _build_commitment(prompt_full, all_oids, rows_list)
     text = _tokenizer.decode(all_oids, skip_special_tokens=True)
     n_prompt, n = len(prompt_full), len(rows_list)
+    usage = {"prompt_tokens": n_prompt, "completion_tokens": n,
+             "total_tokens": n_prompt + n}
+    if cached:
+        # OpenAI-standard shape; the gateway bills a prefix-cache read at its
+        # discounted rate off this field. Clamped: the serve counts cache hits
+        # against the ids WE sent, which on a folded-prefix chunk 1 can exceed
+        # the prompt we report, and an over-report would discount real tokens.
+        usage["prompt_tokens_details"] = {"cached_tokens": min(cached, n_prompt)}
     output = {"choices": [{"index": 0, "finish_reason": "stop",
                            "message": {"role": "assistant", "content": text}}],
-              "usage": {"prompt_tokens": n_prompt, "completion_tokens": n,
-                        "total_tokens": n_prompt + n}}
+              "usage": usage}
     return commitment, output
 
 
@@ -622,6 +648,7 @@ def _leg_plan(n: int):
 
 
 def _leg_cap(per_leg: int) -> dict:
+    # Only max_inflight is this leg's share; max_inflight_total rides undivided.
     c = dict(CAP)
     c["max_inflight"] = per_leg
     return c
