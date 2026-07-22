@@ -96,18 +96,16 @@ def test_burn_target_is_none_for_an_empty_or_all_zero_vector():
 
 
 def test_the_expected_owner_is_the_subnet_owner_hotkey():
-    # netuid 53's SubnetOwnerHotkey, registered at uid 161 — where a burn is
-    # supposed to pay out. This is NOT the master hotkey that signs epoch
-    # results (5DXSBCC…, uid 229); the two are separate keys with separate
-    # jobs, and a burn that lands on the signing key pays the wrong account.
-    assert EXPECTED_OWNER_HOTKEY == "5F2HTUqtk9VWQwXkkUX9oFSXUkAib74qw7s3W7KyZP88AmYe"
-
-
-def test_the_burn_target_is_not_the_signing_key():
-    # 0.2.1 collapsed these two into one value by matching the constant to
-    # what the provider was observed emitting, which silenced the very
-    # tripwire meant to catch that misconfiguration.
-    assert EXPECTED_OWNER_HOTKEY != "5DXSBCCKH5ENuyHFNaAvtaMfbhEEWpjSJB4rzc4mJfsc1uvJ"
+    # Pinned to what the chain reports, not to what the arrangement ought to
+    # be: SubnetOwnerHotkey(53) = this key at uid 229, read at block 8678881.
+    # It doubles as the key that signs epoch results — unusual, but it is the
+    # live configuration, and the chain decides where a burn pays out.
+    #
+    # 0.4.2 moved this to uid 161 (5F2HTUq…) reasoning that a burn should
+    # never land on the signing key. uid 161 is in fact a dead key: no
+    # validator permit, no weights for millions of blocks. Re-derive from
+    # SubnetOwnerHotkey before changing this again.
+    assert EXPECTED_OWNER_HOTKEY == "5DXSBCCKH5ENuyHFNaAvtaMfbhEEWpjSJB4rzc4mJfsc1uvJ"
 
 
 # ── set_weights result handling ──────────────────────────────────

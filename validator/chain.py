@@ -13,10 +13,14 @@ from dataclasses import dataclass
 
 U16 = 65535
 
-# netuid 53's SubnetOwnerHotkey (uid 161) — where a burn is supposed to pay
-# out. Deliberately NOT the master hotkey that signs epoch results
-# (5DXSBCC…, uid 229): signing and receiving are separate jobs held by
-# separate keys, and a burn landing on the signing key pays the wrong account.
+# netuid 53's SubnetOwnerHotkey — where a burn is supposed to pay out. Read
+# off the chain at block 8678881:
+#
+#   SubnetOwnerHotkey(53) = 5DXSBCCKH5…dad19, registered at uid 229
+#
+# On this subnet that is the same key that signs epoch results. Signing and
+# receiving being separate jobs is a sound default, but it is not how netuid
+# 53 is actually configured, and the chain is what decides where a burn pays.
 #
 # A tripwire for a misconfigured owner_hotkey on the provider, which otherwise
 # fails silently in either direction: a burn to an unregistered hotkey
@@ -27,11 +31,13 @@ U16 = 65535
 # Warns, never rejects — a blocking check would take every third-party
 # validator offline the moment subnet ownership legitimately changed hands.
 #
-# 0.2.1 set this to the signing key because that is what the provider was
-# observed emitting. That inverted the check: the constant was moved to agree
-# with the misconfiguration instead of flagging it, so the tripwire could
-# never fire. The provider's owner_hotkey is the thing that is wrong.
-EXPECTED_OWNER_HOTKEY = "5F2HTUqtk9VWQwXkkUX9oFSXUkAib74qw7s3W7KyZP88AmYe"
+# 0.4.2 moved this to uid 161 on the theory that the provider was emitting the
+# signing key by mistake. It was not: uid 161 has held no validator permit and
+# no weights for millions of blocks, and the chain's own SubnetOwnerHotkey
+# says 229. That inverted the tripwire the other way — every burn epoch raised
+# a warning about the correct target, and a burn that did land on uid 161 paid
+# a dead key. Verify against the chain before moving this constant again.
+EXPECTED_OWNER_HOTKEY = "5DXSBCCKH5ENuyHFNaAvtaMfbhEEWpjSJB4rzc4mJfsc1uvJ"
 
 
 def burn_target(weights: list[list]) -> str | None:
