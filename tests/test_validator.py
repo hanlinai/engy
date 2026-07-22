@@ -529,6 +529,21 @@ def test_an_unexpected_burn_target_warns_but_still_submits(tmp_path, capsys):
     assert "5Stranger" in out and "owner" in out.lower()
 
 
+def test_a_burn_to_the_signing_key_is_flagged(tmp_path, capsys):
+    # The live provider misconfiguration: owner_hotkey set to the master key
+    # that signs epoch results instead of the subnet owner. It is registered,
+    # so the burn resolves and pays out with nothing to show it went to the
+    # wrong account — the warning is the only signal that exists.
+    signing_key = "5DXSBCCKH5ENuyHFNaAvtaMfbhEEWpjSJB4rzc4mJfsc1uvJ"
+    cfg = _cfg(tmp_path)
+    fake = FakeChain(hotkeys=["5Filler", signing_key, EXPECTED_OWNER_HOTKEY])
+    client = _client(_payload_with([[signing_key, 65535]]))
+    assert tick(cfg, now=NOW, client=client, chain=fake) == "applied"
+    out = capsys.readouterr().out
+    assert signing_key in out and EXPECTED_OWNER_HOTKEY in out   # the warning
+    assert fake.submitted == [([1], [65535])]                    # lands anyway
+
+
 def test_the_expected_burn_target_is_not_flagged(tmp_path, capsys):
     cfg = _cfg(tmp_path)
     fake = FakeChain(hotkeys=[EXPECTED_OWNER_HOTKEY])

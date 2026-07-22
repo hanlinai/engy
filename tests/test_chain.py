@@ -95,12 +95,19 @@ def test_burn_target_is_none_for_an_empty_or_all_zero_vector():
     assert burn_target([["5A", 0], ["5B", 0]]) is None
 
 
-def test_the_expected_owner_matches_the_providers_configured_value():
-    # The provider's owner_hotkey, registered on netuid 53 at uid 229 — the
-    # same key that signs epoch results, NOT the chain's SubnetOwnerHotkey.
-    # A burn to an unregistered hotkey resolves to no uid at all, so nothing
-    # is submitted and the validator silently sets no weights.
-    assert EXPECTED_OWNER_HOTKEY == "5DXSBCCKH5ENuyHFNaAvtaMfbhEEWpjSJB4rzc4mJfsc1uvJ"
+def test_the_expected_owner_is_the_subnet_owner_hotkey():
+    # netuid 53's SubnetOwnerHotkey, registered at uid 161 — where a burn is
+    # supposed to pay out. This is NOT the master hotkey that signs epoch
+    # results (5DXSBCC…, uid 229); the two are separate keys with separate
+    # jobs, and a burn that lands on the signing key pays the wrong account.
+    assert EXPECTED_OWNER_HOTKEY == "5F2HTUqtk9VWQwXkkUX9oFSXUkAib74qw7s3W7KyZP88AmYe"
+
+
+def test_the_burn_target_is_not_the_signing_key():
+    # 0.2.1 collapsed these two into one value by matching the constant to
+    # what the provider was observed emitting, which silenced the very
+    # tripwire meant to catch that misconfiguration.
+    assert EXPECTED_OWNER_HOTKEY != "5DXSBCCKH5ENuyHFNaAvtaMfbhEEWpjSJB4rzc4mJfsc1uvJ"
 
 
 # ── set_weights result handling ──────────────────────────────────
