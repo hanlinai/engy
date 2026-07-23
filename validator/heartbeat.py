@@ -1,15 +1,16 @@
 """Emit the light validator's liveness heartbeat to the provider (provider
 spec 2026-07-24).
 
-Unlike the master, a light validator reports the epoch digest it verified and
-submitted, so the provider's /admin can reconcile it against the master-signed
-digest. This is NOT an independent rescore — the light validator trusts the
-master's scoring and only checks the signature (validator/sync.py). What it
-reports is therefore "the master-signed result I actually put on chain": a
-sha256 it recomputed over the bytes it fetched and verified. That still catches
-a fork, a wrong master-key pin, or a serve path handing this validator a
-different result than the provider's own latest-finalized epoch — it does not
-catch a master that scored wrong (nothing on the light side can, by design).
+Unlike the master, a light validator reports the **consensus digest** it
+verified and submitted on chain, so the provider's /admin can reconcile it
+against the master-signed digest. This is NOT an independent rescore — the light
+validator trusts the master's scoring and only checks the signature
+(validator/sync.py). The consensus digest is therefore "the master-signed result
+I actually put on chain": sha256 over the bytes it fetched and verified against
+the pinned master key. That still catches a fork, a wrong master-key pin, or a
+serve path handing this validator a different result than the provider's own
+latest-finalized epoch — it does not catch a master that scored wrong (nothing
+on the light side can, by design).
 
 Request signing is the same sr25519 scheme the provider verifies and the master
 uses (engy-validator/engy_validator/signing.py):
@@ -52,15 +53,16 @@ def signed_headers(keypair, netuid: int, method: str, path: str,
 
 def build_body(version: str, synced_epoch: int | None,
                digest: str | None) -> dict:
-    """The heartbeat JSON. `recomputed` is attached only when we have both the
-    epoch and its digest — the provider files a reconciliation claim for exactly
-    that (epoch, digest) pair. A standby submission (no scored vector) reports
-    liveness and the epoch, but no digest to reconcile."""
+    """The heartbeat JSON. `consensus` (the consensus digest) is attached only
+    when we have both the epoch and its digest — the provider files a
+    reconciliation claim for exactly that (epoch, digest) pair. A standby
+    submission (no scored vector) reports liveness and the epoch, but no digest
+    to reconcile."""
     body: dict = {"v": 1, "version": version}
     if synced_epoch is not None:
         body["synced_epoch"] = synced_epoch
         if digest:
-            body["recomputed"] = {"epoch_index": synced_epoch, "digest": digest}
+            body["consensus"] = {"epoch_index": synced_epoch, "digest": digest}
     return body
 
 

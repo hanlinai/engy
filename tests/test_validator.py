@@ -137,7 +137,7 @@ def test_new_epoch_applies_and_records_every_state_field(tmp_path):
     assert last_applied(s) == IDX
     assert last_submit_block(s) == BASE_BLOCK
     assert cached_weights(s) == [["5Aaa", 65535]]
-    # The verified digest is persisted so the liveness heartbeat can report
+    # The consensus digest is persisted so the liveness heartbeat can report
     # which finalized result is on chain.
     assert cached_digest(s) == _payload()["digest"]
 

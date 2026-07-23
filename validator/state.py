@@ -59,12 +59,12 @@ def cached_weights(state: dict) -> list | None:
 
 
 def cached_digest(state: dict) -> str | None:
-    """The master-signed digest of the last vector this validator submitted, or
-    None if absent/malformed. Travels with `cached_weights`: reported in the
-    liveness heartbeat so the provider can reconcile which finalized result this
-    validator is actually running on chain. Display/telemetry only — never a
-    submission input — so a corrupt value simply drops the digest, it never
-    reaches the chain."""
+    """The consensus digest (master-signed) of the last vector this validator
+    submitted, or None if absent/malformed. Travels with `cached_weights`:
+    reported in the liveness heartbeat so the provider can reconcile which
+    finalized result this validator is actually running on chain. Display/
+    telemetry only — never a submission input — so a corrupt value simply drops
+    the digest, it never reaches the chain."""
     d = state.get("cached_digest")
     return d if isinstance(d, str) and d else None
 

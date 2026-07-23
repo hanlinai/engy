@@ -26,10 +26,10 @@ def test_build_body_epoch_without_digest_reports_no_claim():
     assert hb.build_body("v", 12, None) == {"v": 1, "version": "v", "synced_epoch": 12}
 
 
-def test_build_body_epoch_with_digest_attaches_recomputed():
+def test_build_body_epoch_with_digest_attaches_consensus():
     assert hb.build_body("v", 12, "abc") == {
         "v": 1, "version": "v", "synced_epoch": 12,
-        "recomputed": {"epoch_index": 12, "digest": "abc"}}
+        "consensus": {"epoch_index": 12, "digest": "abc"}}
 
 
 def test_signed_headers_verify_against_the_pinned_scheme():
@@ -62,7 +62,7 @@ def test_post_heartbeat_signs_and_sends_and_returns_true():
     assert seen["sig_ok"] is True
     assert seen["hotkey"] == HK.ss58_address
     assert seen["body"] == {"v": 1, "version": "engy-lv 1", "synced_epoch": 12,
-                            "recomputed": {"epoch_index": 12, "digest": "abc"}}
+                            "consensus": {"epoch_index": 12, "digest": "abc"}}
 
 
 def test_post_heartbeat_returns_false_on_non_200_without_raising():
