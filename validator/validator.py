@@ -23,15 +23,17 @@ import os
 import sys
 import threading
 import time
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 
 import httpx
 
 from . import chain as _chain
+from . import heartbeat as _heartbeat
 from .chain import U16, EXPECTED_OWNER_HOTKEY, burn_target
 from .schedule import BLOCK_S, RESUBMIT_BLOCKS, pregate_skip, should_submit
 from .state import (
-    cached_weights, last_applied, last_submit_block, last_submit_ts,
-    read_state, write_state,
+    cached_digest, cached_weights, last_applied, last_submit_block,
+    last_submit_ts, read_state, write_state,
 )
 from .sync import fetch_weights, verify_payload
 
@@ -166,11 +168,14 @@ def tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
 
 
 def _resolve_weights(cfg: dict, state: dict, *, now: float,
-                     client: httpx.Client | None) -> tuple[list | None, int | None, bool, str | None]:
+                     client: httpx.Client | None) -> tuple[list | None, int | None, str | None, bool, str | None]:
     """Pick the vector to submit: a freshly verified one, else the cache.
 
-    Returns (weights, epoch_index, from_cache, failure). `failure` is a tick
-    return code when nothing could be resolved, and None otherwise.
+    Returns (weights, epoch_index, digest, from_cache, failure). `digest` is the
+    master-signed digest of the chosen vector (the verified payload's, or the
+    cached one on a fallback) — reported in the liveness heartbeat, never a
+    submission input. `failure` is a tick return code when nothing could be
+    resolved, and None otherwise.
 
     The cache holds the last vector this validator actually put on chain, so
     falling back to it changes nothing about what miners receive — weights are
@@ -187,17 +192,19 @@ def _resolve_weights(cfg: dict, state: dict, *, now: float,
         ok, reason, weights, idx = verify_payload(
             payload, master_hotkey=cfg["master_hotkey"], netuid=cfg["netuid"])
         if ok:
-            return weights, idx, False, None
+            # payload["digest"] is verified equal to sha256(result_json) inside
+            # verify_payload, so it is the digest of the bytes we accepted.
+            return weights, idx, payload.get("digest"), False, None
         print(f"[sync] payload rejected: {reason}", flush=True)
         failure = f"rejected:{reason}"
 
     applied = last_applied(state)
     cached = cached_weights(state)
     if cached is None or applied is None:
-        return None, None, False, failure
+        return None, None, None, False, failure
     print(f"[sync] no usable payload ({failure}) — resubmitting cached epoch "
           f"{applied} vector ({len(cached)} hotkeys)", flush=True)
-    return cached, applied, True, None
+    return cached, applied, cached_digest(state), True, None
 
 
 def _lands(chain, weights: list | None, hotkeys_on_chain: list[str]) -> bool:
@@ -244,7 +251,7 @@ def _run_tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
     state = read_state(cfg["state_file"])
     applied = last_applied(state)
 
-    weights, epoch, from_cache, failure = _resolve_weights(
+    weights, epoch, digest, from_cache, failure = _resolve_weights(
         cfg, state, now=now, client=client)
     if failure is not None:
         return failure
@@ -330,7 +337,8 @@ def _run_tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
     # been scored.
     write_state(cfg["state_file"], last_applied=epoch, last_submit_block=view.block,
                 last_submit_ts=now,
-                cached_weights=cached_weights(state) if standby else weights)
+                cached_weights=cached_weights(state) if standby else weights,
+                cached_digest=cached_digest(state) if standby else digest)
 
     gap = ("?" if view.block is None or previous_block is None
            else view.block - previous_block)
@@ -343,6 +351,27 @@ def _run_tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
     return "applied" if is_new_epoch else "resubmitted"
 
 
+def _version() -> str:
+    try:
+        return f"engy-lv {_pkg_version('engy-sn53')}"
+    except PackageNotFoundError:
+        return "engy-lv unknown"
+
+
+def emit_provider_heartbeat(cfg: dict, keypair, version: str) -> None:
+    """Report liveness + the digest this validator is running on chain to the
+    provider's /admin view. Reads what was last submitted from state, so it
+    reflects on-chain truth (not merely what was just fetched). Best-effort:
+    post_heartbeat never raises, and a None keypair (wallet unavailable) skips
+    it entirely — the local heartbeat file remains the real watchdog signal."""
+    if keypair is None:
+        return
+    state = read_state(cfg["state_file"])
+    _heartbeat.post_heartbeat(
+        cfg["api"], keypair, cfg["netuid"], version=version,
+        synced_epoch=last_applied(state), digest=cached_digest(state))
+
+
 def main() -> None:
     cfg = load_config()
     print(f"[engy-sn53-validator] api={cfg['api']} netuid={cfg['netuid']} "
@@ -350,12 +379,23 @@ def main() -> None:
     print(f"[health] heartbeat={cfg['heartbeat_file']} "
           f"stall_limit={stall_limit(cfg['poll_s'])}s", flush=True)
     _start_watchdog(cfg)
+    version = _version()
+    # The signing key is this validator's own wallet hotkey — loaded once, and
+    # optional: a wallet that cannot be opened disables only the provider
+    # heartbeat, never the submit loop.
+    try:
+        hb_keypair = _heartbeat.load_hotkey_keypair(cfg["wallet"], cfg["wallet_hotkey"])
+    except Exception as e:
+        print(f"[heartbeat] wallet load failed ({type(e).__name__}: {e}); "
+              f"provider heartbeat disabled", flush=True)
+        hb_keypair = None
     try:
         while True:
             try:
                 tick(cfg, now=time.time())
             except Exception as e:
                 print(f"[sync] tick error: {e}", flush=True)
+            emit_provider_heartbeat(cfg, hb_keypair, version)
             time.sleep(cfg["poll_s"])
     except KeyboardInterrupt:
         pass

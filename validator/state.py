@@ -58,12 +58,25 @@ def cached_weights(state: dict) -> list | None:
     return w if well_formed_weights(w) else None
 
 
+def cached_digest(state: dict) -> str | None:
+    """The master-signed digest of the last vector this validator submitted, or
+    None if absent/malformed. Travels with `cached_weights`: reported in the
+    liveness heartbeat so the provider can reconcile which finalized result this
+    validator is actually running on chain. Display/telemetry only — never a
+    submission input — so a corrupt value simply drops the digest, it never
+    reaches the chain."""
+    d = state.get("cached_digest")
+    return d if isinstance(d, str) and d else None
+
+
 def write_state(path: str, *, last_applied: int, last_submit_block: int | None,
-                last_submit_ts: float, cached_weights: list | None) -> None:
+                last_submit_ts: float, cached_weights: list | None,
+                cached_digest: str | None = None) -> None:
     """Replace the state file atomically. Call only after a successful submit.
 
     `cached_weights` is None when the submission was a standby vector: the
-    anchor advances, but there is no scored vector worth caching.
+    anchor advances, but there is no scored vector worth caching. `cached_digest`
+    travels with it — the digest of that scored vector, or None on a standby.
     """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
@@ -71,5 +84,6 @@ def write_state(path: str, *, last_applied: int, last_submit_block: int | None,
         json.dump({"last_applied": last_applied,
                    "last_submit_block": last_submit_block,
                    "last_submit_ts": last_submit_ts,
-                   "cached_weights": cached_weights}, f)
+                   "cached_weights": cached_weights,
+                   "cached_digest": cached_digest}, f)
     os.replace(tmp, path)

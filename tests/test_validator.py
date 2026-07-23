@@ -9,7 +9,7 @@ from bittensor_wallet import Keypair
 from validator import chain as chain_mod
 from validator.chain import EXPECTED_OWNER_HOTKEY
 from validator.state import (
-    read_state, last_applied, last_submit_block, cached_weights,
+    read_state, last_applied, last_submit_block, cached_weights, cached_digest,
 )
 from validator.schedule import BLOCK_S, RESUBMIT_BLOCKS
 from validator.sync import epoch_message, MAX_RESPONSE_BYTES
@@ -137,6 +137,9 @@ def test_new_epoch_applies_and_records_every_state_field(tmp_path):
     assert last_applied(s) == IDX
     assert last_submit_block(s) == BASE_BLOCK
     assert cached_weights(s) == [["5Aaa", 65535]]
+    # The verified digest is persisted so the liveness heartbeat can report
+    # which finalized result is on chain.
+    assert cached_digest(s) == _payload()["digest"]
 
 
 def test_same_epoch_holds_until_the_resubmit_interval(tmp_path):
@@ -654,7 +657,11 @@ def test_a_standby_burn_is_not_cached_as_this_epoch_s_weights(tmp_path):
     out = tick(cfg, now=NOW + INTERVAL_S,
                client=_client(_payload_with([["5Ghost", 65535]])), chain=fake)
     assert out == "standby:burn"
-    assert cached_weights(read_state(cfg["state_file"])) == [["5Aaa", 65535]]
+    s = read_state(cfg["state_file"])
+    # The digest travels with the cached vector: a standby leaves both at the
+    # last genuinely scored epoch, never the burn.
+    assert cached_weights(s) == [["5Aaa", 65535]]
+    assert cached_digest(s) == _payload()["digest"]
 
 
 # ── configuration surface ────────────────────────────────────────
