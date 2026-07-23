@@ -59,14 +59,17 @@ secret — it identifies this miner.
 ## 3. Start the serve
 
 Start an sglang serve with `--enable-return-hidden-states` — the miner needs the
-activations to build the proof. That flag is the only requirement; nothing is
-installed into the serve.
+activations to build the proof — and put the `miner/` folder on its `PYTHONPATH`
+so the serve picks up `sitecustomize.py`, which trims the hidden states it
+returns down to the rows the proof reads. Nothing on disk is modified, and the
+proof is unchanged.
 
 ### Reference config — 4 × RTX 4090 (24 GB), Qwen3.6-35B-A3B-FP8
 
 A working production configuration, not an illustration:
 
 ```bash
+PYTHONPATH=/path/to/engy/miner \
 python -m sglang.launch_server \
   --model-path /data/models/Qwen/Qwen3.6-35B-A3B-FP8 \
   --served-model-name Qwen3.6 \
