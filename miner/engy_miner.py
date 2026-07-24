@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import socket
 import subprocess
 import threading
@@ -572,6 +573,153 @@ def _build_commitment(prompt_full, all_oids, rows_list):
                        "skip_prefill": True, "n_tokens": n, "prompt_ids": prompt_full}}
 
 
+# ---- Qwen3.6 output parsing: tool calls + reasoning --------------------------
+# /generate returns hidden states (which the proof needs) but doesn't run sglang's
+# tool/reasoning parsers, so we reproduce them here. skip_special_tokens=True keeps
+# the <think>/<tool_call> markers (dropping only control tokens like <|im_end|>).
+# Thinking-on means the template opens <think> in the prompt, so output starts
+# inside the block: reasoning … </think> … answer/tool_call.
+_FUNC_RE = re.compile(r"<function=\s*(.*?)\s*>(.*?)</function>", re.DOTALL)
+_PARAM_RE = re.compile(r"<parameter=\s*(.*?)\s*>\s*(.*?)\s*</parameter>", re.DOTALL)
+_TOOLCALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+
+
+def _tool_param_types(tools):
+    """{fn: {param: json-schema-type}} from the request tools, to coerce the string
+    values qwen3_coder emits back to their declared types."""
+    out = {}
+    for t in tools or []:
+        fn = (t or {}).get("function") or {}
+        name = fn.get("name")
+        props = ((fn.get("parameters") or {}).get("properties")) or {}
+        if name:
+            out[name] = {k: (v or {}).get("type") for k, v in props.items()}
+    return out
+
+
+def _coerce(val, typ):
+    try:
+        if typ == "integer":
+            return int(val)
+        if typ == "number":
+            return float(val)
+        if typ == "boolean":
+            return val.strip().lower() in ("true", "1", "yes")
+        if typ in ("object", "array"):
+            return json.loads(val)
+    except Exception:
+        pass
+    return val
+
+
+def _parse_tool_calls(text, ptypes):
+    """Every <tool_call>…</tool_call> in `text` -> OpenAI tool_calls."""
+    calls = []
+    for body in _TOOLCALL_RE.findall(text):
+        fm = _FUNC_RE.search(body)
+        if not fm:
+            continue
+        name = fm.group(1).strip()
+        args = {k.strip(): _coerce(v, (ptypes.get(name) or {}).get(k.strip()))
+                for k, v in _PARAM_RE.findall(fm.group(2))}
+        calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                      "function": {"name": name, "arguments": json.dumps(args)}})
+    return calls
+
+
+def _split_think(text, think_open):
+    """(visible_text, reasoning). think_open = the prompt left <think> open."""
+    if "</think>" in text:
+        head, _, tail = text.partition("</think>")
+        return tail.lstrip("\n"), head.split("<think>", 1)[-1].strip()
+    if think_open:                       # opened, never closed: it is all reasoning
+        return "", text.split("<think>", 1)[-1].strip()
+    if text.startswith("<think>"):       # emitted inline, unclosed
+        return "", text[len("<think>"):].strip()
+    return text, ""
+
+
+def _assemble_message(text, tools, think_open):
+    """Raw decoded output -> (OpenAI assistant message, finish_reason). A pure-
+    reasoning turn falls back to the reasoning so content is never empty."""
+    visible, reasoning = _split_think(text, think_open)
+    calls = (_parse_tool_calls(visible, _tool_param_types(tools))
+             if "<tool_call>" in visible else [])
+    if calls:                            # keep only the natural-language lead-in
+        visible = visible.split("<tool_call>", 1)[0]
+    content = visible.strip()
+    msg = {"role": "assistant", "content": content or None}
+    if calls:
+        msg["tool_calls"] = calls
+    if reasoning:
+        msg["reasoning_content"] = reasoning
+    if msg["content"] is None and not calls:
+        msg["content"] = reasoning
+    return msg, ("tool_calls" if calls else "stop")
+
+
+class _QwenStream:
+    """Streaming _assemble_message: raw text deltas -> structured
+    {reasoning_content|content|tool_calls} deltas. Reasoning and content stream
+    live; a tool call is buffered until whole, then emitted parsed. A short tail is
+    held back each step so a marker split across two deltas isn't mis-emitted."""
+    _HOLD = len("</tool_call>")          # longest marker we must not split across
+
+    def __init__(self, tools, think_open, emit):
+        self.ptypes = _tool_param_types(tools)
+        self.emit = emit
+        self.buf = ""
+        self.in_think = think_open
+        self.tool_buf = None             # not None once <tool_call> has started
+
+    def _emit_safe(self, key):
+        keep = self.buf[-self._HOLD:] if len(self.buf) > self._HOLD else self.buf
+        safe = self.buf[:len(self.buf) - len(keep)]
+        if safe:
+            self.emit({key: safe})
+            self.buf = keep
+
+    def feed(self, delta):
+        if not delta:
+            return
+        if self.tool_buf is not None:    # a tool call is in flight: just accumulate
+            self.tool_buf += delta
+            return
+        self.buf += delta
+        if self.in_think:
+            if "</think>" in self.buf:
+                head, _, tail = self.buf.partition("</think>")
+                r = head.split("<think>", 1)[-1]
+                if r:
+                    self.emit({"reasoning_content": r})
+                self.in_think = False
+                self.buf = tail.lstrip("\n")
+            else:
+                self._emit_safe("reasoning_content")
+                return
+        if "<tool_call>" in self.buf:
+            pre, _, rest = self.buf.partition("<tool_call>")
+            if pre.strip():
+                self.emit({"content": pre})
+            self.tool_buf = "<tool_call>" + rest
+            self.buf = ""
+            return
+        self._emit_safe("content")
+
+    def finish(self):
+        if self.tool_buf is not None:
+            calls = _parse_tool_calls(self.tool_buf, self.ptypes)
+            if calls:
+                self.emit({"tool_calls": [
+                    {"index": i, "id": c["id"], "type": "function",
+                     "function": c["function"]} for i, c in enumerate(calls)]})
+            return
+        tail = self.buf.strip()
+        if tail:
+            self.emit({"reasoning_content": tail} if self.in_think
+                      else {"content": tail})
+
+
 def _process(request: dict, emit=None, job=None):
     """One routed request end-to-end (runs in a worker thread): chat-template ->
     chunked generation with hidden states -> proof + OpenAI completion body.
@@ -579,10 +727,23 @@ def _process(request: dict, emit=None, job=None):
     `job` carries cancellation: if the gateway says the buyer is gone this raises
     _Cancelled at the next checkpoint, and the `finally` below still returns the
     serve slot."""
-    messages = [{"role": m["role"], "content": m["content"]} for m in request.get("messages", [])]
-    prompt = _tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    # Messages pass verbatim (keeps tool_calls, tool results, `name`); tools render
+    # into the template. Thinking stays on unless the buyer's chat_template_kwargs
+    # says otherwise — we honor it but never force it off (the refminer standard).
+    messages = request.get("messages", [])
+    tools = request.get("tools")
+    tmpl = dict(request.get("chat_template_kwargs") or {})
+    if tools:
+        tmpl["tools"] = tools
+    prompt = _tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, **tmpl)
     prompt_ids = [int(i) for i in _tokenizer(prompt).input_ids]
+    think_open = prompt.rstrip().endswith("<think>")   # template opened <think>
     max_new = min(int(request.get("max_tokens") or MAX_TOKENS), OUT_MAX)
+
+    # Streaming: reparse raw serve text into structured reasoning/content/tool_call
+    # deltas (the shape the serve's OpenAI parsers would emit).
+    stream = _QwenStream(tools, think_open, emit) if emit is not None else None
 
     # Never clamp, never refuse: the miner's job is to finish every request the
     # gateway routes to it. Truncating a buyer's output or rejecting a long
@@ -592,13 +753,16 @@ def _process(request: dict, emit=None, job=None):
         job.serve = serve            # _on_cancel needs this to address the abort
     try:
         all_oids, rows_list, prompt_extra, cached = _generate_chunked(
-            serve, prompt_ids, max_new, emit, job)
+            serve, prompt_ids, max_new, (stream.feed if stream else None), job)
     finally:
         _release_serve(serve)
+    if stream is not None:
+        stream.finish()
 
     prompt_full = prompt_ids + prompt_extra
     commitment = _build_commitment(prompt_full, all_oids, rows_list)
     text = _tokenizer.decode(all_oids, skip_special_tokens=True)
+    msg, finish = _assemble_message(text, tools, think_open)
     n_prompt, n = len(prompt_full), len(rows_list)
     usage = {"prompt_tokens": n_prompt, "completion_tokens": n,
              "total_tokens": n_prompt + n}
@@ -608,8 +772,7 @@ def _process(request: dict, emit=None, job=None):
         # against the ids WE sent, which on a folded-prefix chunk 1 can exceed
         # the prompt we report, and an over-report would discount real tokens.
         usage["prompt_tokens_details"] = {"cached_tokens": min(cached, n_prompt)}
-    output = {"choices": [{"index": 0, "finish_reason": "stop",
-                           "message": {"role": "assistant", "content": text}}],
+    output = {"choices": [{"index": 0, "finish_reason": finish, "message": msg}],
               "usage": usage}
     return commitment, output
 
@@ -681,8 +844,8 @@ async def _serve(ws, frame):
     loop = asyncio.get_running_loop()
     q: asyncio.Queue = asyncio.Queue()
 
-    def emit(text):                       # worker thread -> event loop
-        loop.call_soon_threadsafe(q.put_nowait, {"content": text})
+    def emit(delta):                      # worker thread -> event loop (structured dict)
+        loop.call_soon_threadsafe(q.put_nowait, delta)
 
     streaming = bool(frame.get("stream"))
     # Registered BEFORE the work is queued: a CANCEL can arrive while the request
