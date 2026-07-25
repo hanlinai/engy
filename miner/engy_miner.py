@@ -720,6 +720,40 @@ class _QwenStream:
                       else {"content": tail})
 
 
+def _normalize_messages(messages):
+    """Chat templates want tool-call `arguments` as a mapping, but the OpenAI wire
+    format carries it as a JSON string — including the calls WE emit. So an agentic
+    buyer echoing turn 1 back on turn 2 hit `arguments|items` in the Qwen template
+    and raised TypeError. Parse it back to a dict (what sglang's OpenAI route does),
+    copying rather than mutating the buyer's request. A malformed or non-object
+    payload degrades to {}: render the call with no parameters, never fail the turn."""
+    out = []
+    for m in messages:
+        calls = m.get("tool_calls") if isinstance(m, dict) else None
+        if not isinstance(calls, list):
+            out.append(m)
+            continue
+        fixed = []
+        for c in calls:
+            # nested {"function": {...}} (OpenAI) or the flat {"name", "arguments"}
+            # shape — the template accepts both, so preserve whichever we got.
+            fn = c.get("function") if isinstance(c, dict) else None
+            inner = fn if isinstance(fn, dict) else c
+            args = inner.get("arguments") if isinstance(inner, dict) else None
+            if isinstance(args, str):
+                try:
+                    parsed = json.loads(args or "{}")
+                except ValueError:
+                    parsed = {}
+                if not isinstance(parsed, dict):
+                    parsed = {}
+                inner = {**inner, "arguments": parsed}
+                c = {**c, "function": inner} if isinstance(fn, dict) else inner
+            fixed.append(c)
+        out.append({**m, "tool_calls": fixed})
+    return out
+
+
 def _process(request: dict, emit=None, job=None):
     """One routed request end-to-end (runs in a worker thread): chat-template ->
     chunked generation with hidden states -> proof + OpenAI completion body.
@@ -730,7 +764,7 @@ def _process(request: dict, emit=None, job=None):
     # Messages pass verbatim (keeps tool_calls, tool results, `name`); tools render
     # into the template. Thinking stays on unless the buyer's chat_template_kwargs
     # says otherwise — we honor it but never force it off (the refminer standard).
-    messages = request.get("messages", [])
+    messages = _normalize_messages(request.get("messages", []))
     tools = request.get("tools")
     tmpl = dict(request.get("chat_template_kwargs") or {})
     if tools:
