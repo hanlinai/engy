@@ -21,9 +21,42 @@ players, the proof, scoring and emissions, and gateway routing on one page.
 - Company: [hanlin.ai](https://hanlin.ai)
 - Contact: ning@engy.ai
 
-Launching in stages: the one-pager, model specs, and the light validator below
-are public now; the audit verifier, miner client, and full incentive mechanism
-follow.
+Launching in stages: the one-pager, model specs, the miner client, and the
+light validator below are public now; the audit verifier and full incentive
+mechanism follow.
+
+## Run a miner
+
+**Full runbook: [docs/MINER.md](docs/MINER.md)** — install, serve
+configuration, connecting, and the model spec. The summary below is the short
+version.
+
+The miner in [miner/](miner/) serves buyer requests routed from the gateway on
+a local sglang serve and returns, with each completion, a compact TOPLOC proof
+that the response really came from the model it claims to run. One process
+does everything: connect, generate, prove, answer. No local HTTP endpoint and
+no extra hops.
+
+1. Install [sglang](https://github.com/sgl-project/sglang) and the miner deps
+   (`toploc transformers torch numpy requests websockets`), put the model
+   checkpoint on local disk, and get a miner key from
+   [provider.engy.ai](https://provider.engy.ai).
+2. Start an sglang serve with `--enable-return-hidden-states` and the
+   `miner/` folder on its `PYTHONPATH` (the runbook has a working 4 × RTX 4090
+   reference config).
+3. Start the miner, pointing it at your serve and checkpoint:
+
+       GW=wss://api.engy.ai/gw MINER_KEY=<your-key> MODEL=qwen3.6-35b-a3b \
+       MAX_INFLIGHT=<serve concurrency, minimum 8> \
+       python miner/engy_miner.py \
+           --checkpoint /data/models/Qwen/Qwen3.6-35B-A3B-FP8 \
+           --serve-url  http://127.0.0.1:8000
+
+`MAX_INFLIGHT`, the total number of requests your serve can run at once, is
+the one capacity number a miner declares. The gateway requires a minimum of 8.
+The request shape limits (max input tokens, max output tokens, request
+timeout) are the model's spec, held by the gateway and applied to every miner
+serving that model.
 
 ## Run a light validator
 

@@ -102,7 +102,7 @@ websocket legs and sends a HELLO — that connect+admit **is** the register.
 
 ```bash
 GW=wss://<gateway-host>/gw MINER_KEY=<your-key> MODEL=qwen3.6-35b-a3b \
-MAX_INFLIGHT=<serve concurrency> \
+MAX_INFLIGHT=<serve concurrency, minimum 8> \
 python miner/engy_miner.py \
     --checkpoint /data/models/Qwen/Qwen3.6-35B-A3B-FP8 \
     --serve-url  http://127.0.0.1:8000
@@ -114,7 +114,7 @@ least-in-flight balances across them).
 The gateway-host is `api.engy.ai`.
 
 **The only capacity a miner declares is `MAX_INFLIGHT` — how many requests it can
-run at once.** It is a *total*: the miner splits it across the legs it opens and
+run at once. The gateway requires a minimum of 8.** It is a *total*: the miner splits it across the legs it opens and
 also sends it undivided, so the gateway records your real concurrency instead of
 inferring it from one leg's share. The request *shape* limits (max input tokens,
 max output tokens, request timeout) are **the model's spec**, held by the gateway
@@ -125,7 +125,7 @@ in `public.models` and applied to every miner serving that model.
 | `MINER_KEY` | your key | required |
 | `GW` | `wss://<gateway-host>/gw` | gateway websocket URL — **required**, there is no default |
 | `MODEL` | e.g. `qwen3.6-35b-a3b` | the gateway's model id |
-| `MAX_INFLIGHT` | `--max-running-requests` × **dp-size** | **the one number you own.** sglang's cap is **per DP replica**, so a dp=2 serve runs 2×. Under-set it and the gateway under-drives the serve; over-set it and requests queue past the model's timeout and are abandoned. |
+| `MAX_INFLIGHT` | `--max-running-requests` × **dp-size** | **the one number you own. Minimum 8** — the gateway does not admit a smaller declaration. sglang's cap is **per DP replica**, so a dp=2 serve runs 2×. Under-set it and the gateway under-drives the serve; over-set it and requests queue past the model's timeout and are abandoned. |
 | `ENGY_WORKER_NAME` | a name for **this machine** | only when several machines share one `MINER_KEY` — each registers as its own named worker. Default derives from hostname+model+serves. |
 
 `MAX_INPUT_TOKENS` / `MAX_OUTPUT_TOKENS` / `MAX_REQUEST_S` are still sent in the
