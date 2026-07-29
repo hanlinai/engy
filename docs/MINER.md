@@ -59,7 +59,8 @@ secret — it identifies this miner.
 ## 3. Start the serve
 
 Start an sglang serve with `--enable-return-hidden-states` — the miner needs the
-activations to build the proof — and put the `miner/` folder on its `PYTHONPATH`
+activations to build the proof — plus the tool-call and reasoning parsers your
+model needs (see below), and put the `miner/` folder on its `PYTHONPATH`
 so the serve picks up `sitecustomize.py`, which trims the hidden states it
 returns down to the rows the proof reads. Nothing on disk is modified, and the
 proof is unchanged.
@@ -78,8 +79,20 @@ python -m sglang.launch_server \
   --chunked-prefill-size 8192 \
   --max-running-requests 8 --context-length 262144 \
   --enable-return-hidden-states --enable-cache-report \
+  --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
   --host 0.0.0.0 --port 8000
 ```
+
+`--tool-call-parser` and `--reasoning-parser` are **required for agentic buyers**.
+Qwen3.6 emits its tool calls as nested XML
+(`<tool_call><function=NAME><parameter=KEY>…`) inside a `<think>` block. Without
+these two flags sglang has no parser to run, so it hands that raw markup back as
+`content` with `tool_calls: null` and `finish_reason: "stop"` — the buyer sees an
+assistant that narrates what it is about to do and never calls anything, and an
+agent loop ends after one turn. Measured on a serve started without them: **0 of
+100 tool-call requests succeeded**, on every prompt, including with
+`tool_choice: "required"`. The model is not at fault — it emits correct calls;
+there is simply nothing configured to parse them.
 
 `--enable-cache-report` turns on cached-token accounting. The miner passes the
 count on to the gateway as `usage.prompt_tokens_details.cached_tokens`, which is
