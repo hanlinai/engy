@@ -261,9 +261,165 @@ class Load:
         return 0.0 if self.inflight else time.time() - self.last_idle
 
 
+# ------------------------------------------------------------------ the lanes
+# Sampling and tooling params the gateway may forward, passed straight through so
+# a buyer's temperature/top_p/stop/tools/response_format/seed take effect.
+# reasoning_effort and chat_template_kwargs BOTH gate thinking on GLM-5.2.
+_PASSTHROUGH = ("temperature", "top_p", "n", "stop", "presence_penalty",
+                "frequency_penalty", "seed", "logit_bias", "logprobs",
+                "top_logprobs", "response_format", "tools", "tool_choice",
+                "parallel_tool_calls", "user", "top_k", "min_p",
+                "repetition_penalty", "stop_token_ids", "chat_template_kwargs",
+                "reasoning_effort")
+
+# Meaningful only on the raw text-completions lane. `echo` is the one that
+# matters: with echo=true plus logprobs, sglang returns per-token logprobs over
+# the PROMPT tokens, which is the point of the lane.
+_TEXT_PASSTHROUGH = ("echo", "suffix", "best_of")
+
+
+def _raise_with_body(r) -> None:
+    """httpx raises on 4xx/5xx with only the status line and an MDN link, which
+    hides what the serve actually said. Surface the body."""
+    if r.status_code < 400:
+        return
+    try:
+        detail = r.text
+    except Exception:
+        detail = ""
+    raise RuntimeError(f"serve {r.status_code}: {detail[:1000]}")
+
+
+def _merge_tool_calls(acc: list, deltas: list) -> list:
+    """Accumulate streamed tool-call fragments by index. OpenAI streams
+    `function.arguments` as partial strings across chunks, so the pieces must be
+    concatenated rather than overwritten or the call arrives truncated."""
+    out = list(acc)
+    for d in deltas or []:
+        i = d.get("index", 0)
+        while len(out) <= i:
+            out.append({"index": len(out), "type": "function",
+                        "function": {"name": "", "arguments": ""}})
+        cur = out[i]
+        if d.get("id"):
+            cur["id"] = d["id"]
+        if d.get("type"):
+            cur["type"] = d["type"]
+        fn = d.get("function") or {}
+        if fn.get("name"):
+            cur["function"]["name"] = fn["name"]
+        if fn.get("arguments"):
+            cur["function"]["arguments"] += fn["arguments"]
+    return out
+
+
+def is_text_completion(request: dict) -> bool:
+    """True if this is a raw text completion rather than a chat request.
+
+    Keyed on `prompt` being present rather than on a flag the gateway sets, so
+    there is exactly one source of truth. `prompt` may be a string or a list of
+    token ids. An empty-string prompt is still a prompt, so test for None."""
+    return request.get("prompt") is not None and not request.get("messages")
+
+
+def is_span_scoring(request: dict) -> bool:
+    """True if the caller wants logprobs for a SPAN, not the whole prompt.
+
+    `logprob_start_len` is a native /generate parameter; the OpenAI
+    /v1/completions surface has no equivalent, which is why `echo` there is
+    all-or-nothing. That all-or-nothing behaviour is what makes long-prefix
+    scoring fatal: `echo` materialises a [prompt_tokens x vocab] fp32 logits
+    tensor (roughly 0.6 MB per prompt token on GLM-5.2), so a 20k prefix wants
+    about 11.5 GiB while only a few hundred MiB is free at mem-fraction 0.80.
+    Scoring a span costs scored_tokens x vocab x 4 instead."""
+    return request.get("logprob_start_len") is not None
+
+
+def _span_logprobs(meta: dict) -> dict:
+    """Map /generate's `input_token_logprobs` to the OpenAI logprobs shape.
+
+    sglang returns [logprob, token_id, token_text] triples, one per scored
+    token.
+
+    We deliberately do NOT ask for `return_text_in_logprobs`. Measured on the
+    live engine, that flag COLLAPSES the array: scoring 5 tokens returns 5
+    entries with a null text field, but with the flag it returns ONE entry whose
+    text is the whole span concatenated. That destroys the per-token breakdown a
+    scorer exists to read, and it fails as a plausible-looking 200.
+
+    So the logprobs come back with their TOKEN IDS instead of text, which is the
+    stronger alignment anyway for a caller that sent input_ids. `tokens` and
+    `text_offset` are omitted rather than faked."""
+    triples = meta.get("input_token_logprobs") or []
+    return {"token_logprobs": [t[0] if len(t) > 0 else None for t in triples],
+            "token_ids": [t[1] if len(t) > 1 else None for t in triples]}
+
+
+def _assistant_message(msg: dict) -> dict:
+    """Preserve `tool_calls` (essential for agentic clients) and
+    `reasoning_content`; drop upstream extras.
+
+    `content` is passed through verbatim INCLUDING when empty because the model
+    spent its whole budget thinking. Falling back to the reasoning text there
+    would publish the model's raw chain of thought to end users as if it were
+    the answer, silently and in the dangerous direction."""
+    out = {"role": "assistant", "content": msg.get("content")}
+    if msg.get("tool_calls"):
+        out["tool_calls"] = msg["tool_calls"]
+    reasoning = msg.get("reasoning_content") or msg.get("reasoning")
+    if reasoning:
+        out["reasoning_content"] = reasoning
+    return out
+
+
+def _clean_usage(raw: dict) -> dict:
+    u = {"prompt_tokens": int(raw.get("prompt_tokens") or 0),
+         "completion_tokens": int(raw.get("completion_tokens") or 0)}
+    u["total_tokens"] = int(raw.get("total_tokens") or
+                            u["prompt_tokens"] + u["completion_tokens"])
+    details = raw.get("prompt_tokens_details")
+    if isinstance(details, dict) and details.get("cached_tokens") is not None:
+        u["prompt_tokens_details"] = {
+            "cached_tokens": int(details["cached_tokens"])}
+    return u
+
+
+def _chat_completion(model, message, usage, finish_reason="stop",
+                     logprobs=None) -> dict:
+    if isinstance(message, str):
+        message = {"role": "assistant", "content": message}
+    choice = {"index": 0, "finish_reason": finish_reason, "message": message}
+    if logprobs is not None:
+        choice["logprobs"] = logprobs
+    return {"id": "chatcmpl-" + uuid.uuid4().hex[:12],
+            "object": "chat.completion", "model": model,
+            "choices": [choice], "usage": usage}
+
+
+def _text_completion(model, text, usage, finish_reason="stop",
+                     logprobs=None) -> dict:
+    """The logprobs block is passed through VERBATIM. On an echo request sglang
+    fills token_logprobs/tokens/text_offset over the prompt tokens with a
+    leading None for the first token, which has no predecessor to be
+    conditioned on. That None is meaningful and must survive, so nothing here
+    filters or re-indexes the array."""
+    choice = {"index": 0, "finish_reason": finish_reason,
+              "text": text if isinstance(text, str) else str(text)}
+    if logprobs is not None:
+        choice["logprobs"] = logprobs
+    return {"id": "cmpl-" + uuid.uuid4().hex[:12], "object": "text_completion",
+            "model": model, "choices": [choice], "usage": usage}
+
+
 # --------------------------------------------------------------------- backend
 class Serve:
-    """The local OpenAI-compatible serve, least-in-flight balanced across urls."""
+    """The local OpenAI-compatible serve, least-in-flight balanced across urls.
+
+    Three lanes, picked from the request rather than from a gateway flag:
+      chat            -> /v1/chat/completions   (streamed)
+      text completion -> /v1/completions        (whole prompt, echo lane)
+      span scoring    -> /generate              (native, logprob_start_len)
+    """
 
     def __init__(self, urls: list[str], served_model: str, read_timeout: float):
         self.urls = urls
@@ -279,21 +435,139 @@ class Serve:
     def _release(self, u: str):
         self._n[u] = max(0, self._n.get(u, 0) - 1)
 
+    @staticmethod
+    def _root(url: str) -> str:
+        """Base without a trailing /v1: /generate does not live under /v1."""
+        return url[:-3].rstrip("/") if url.endswith("/v1") else url.rstrip("/")
+
+    @staticmethod
+    def _v1(url: str) -> str:
+        return url.rstrip("/") if url.endswith("/v1") else url.rstrip("/") + "/v1"
+
+    def _chat_body(self, request: dict, *, stream: bool) -> dict:
+        body = {"model": self.served_model or request.get("model"),
+                "messages": request.get("messages", [])}
+        if request.get("max_tokens"):
+            body["max_tokens"] = request["max_tokens"]
+        for k in _PASSTHROUGH:
+            if request.get(k) is not None:
+                body[k] = request[k]
+        if stream:
+            body["stream"] = True
+            body["stream_options"] = {"include_usage": True}
+        return body
+
+    def _text_body(self, request: dict) -> dict:
+        """Body for the RAW text-completions lane.
+
+        The contract is byte fidelity: `prompt` is forwarded EXACTLY as the
+        buyer sent it, no chat template and no normalisation, because the caller
+        rendered the template itself and is scoring a span at a known offset.
+        A list-of-ints prompt stays pre-tokenised.
+
+        `max_tokens: 0` is preserved rather than dropped: echo-scoring asks for
+        no new tokens at all, so the truthiness idiom used on the chat lane
+        would wrongly treat 0 as absent."""
+        body = {"model": self.served_model or request.get("model"),
+                "prompt": request.get("prompt")}
+        if request.get("max_tokens") is not None:
+            body["max_tokens"] = request["max_tokens"]
+        for k in _PASSTHROUGH + _TEXT_PASSTHROUGH:
+            if request.get(k) is not None:
+                body[k] = request[k]
+        # top_logprobs is the chat-lane spelling; the text lane carries the
+        # count in `logprobs` itself, so never forward both.
+        body.pop("top_logprobs", None)
+        return body
+
+    def _generate_body(self, request: dict) -> dict:
+        """Translate a span-scoring completion into a native /generate call.
+
+        `prompt` maps to `text` for a string and `input_ids` for token ids,
+        keeping pre-tokenised input pre-tokenised, which is the whole reason a
+        scorer sends ids. `return_text_in_logprobs` is deliberately unset; see
+        _span_logprobs."""
+        p = request.get("prompt")
+        body: dict = {
+            "sampling_params": {
+                "max_new_tokens": request.get("max_tokens") or 1,
+                "temperature": request.get("temperature", 0),
+            },
+            "return_logprob": True,
+            "logprob_start_len": int(request["logprob_start_len"]),
+        }
+        if isinstance(p, list) and p and all(isinstance(x, int) for x in p):
+            body["input_ids"] = p
+        else:
+            body["text"] = p
+        for k in ("top_p", "top_k", "min_p", "stop", "seed",
+                  "repetition_penalty", "frequency_penalty",
+                  "presence_penalty"):
+            if request.get(k) is not None:
+                body["sampling_params"][k] = request[k]
+        return body
+
+    async def complete(self, request: dict) -> dict:
+        """The two non-streaming lanes: span scoring and raw text completion."""
+        url = self._pick()
+        model = request.get("model")
+        timeout = httpx.Timeout(self.read_timeout, connect=10.0)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as c:
+                if is_span_scoring(request):
+                    r = await c.post(self._root(url) + "/generate",
+                                     json=self._generate_body(request))
+                    _raise_with_body(r)
+                    j = r.json()
+                    meta = j.get("meta_info") or {}
+                    usage = {
+                        "prompt_tokens": meta.get("prompt_tokens") or 0,
+                        "completion_tokens": meta.get("completion_tokens") or 0}
+                    usage["total_tokens"] = (usage["prompt_tokens"]
+                                             + usage["completion_tokens"])
+                    # Native /generate reports the prefix-cache hit as a FLAT
+                    # `cached_tokens`, not the nested OpenAI shape the other
+                    # lanes give. Without re-nesting it the gateway sees no
+                    # cache hit and bills the whole prefix at the full input
+                    # rate, which is exactly backwards for span scoring, the
+                    # one workload that re-sends an identical multi-thousand
+                    # token prefix on every request.
+                    cached = meta.get("cached_tokens")
+                    if cached is not None:
+                        usage["prompt_tokens_details"] = {
+                            "cached_tokens": int(cached)}
+                    fr = meta.get("finish_reason")
+                    finish = (fr.get("type") if isinstance(fr, dict) else fr) or "stop"
+                    return _text_completion(model, j.get("text") or "", usage,
+                                            finish, _span_logprobs(meta))
+
+                r = await c.post(self._v1(url) + "/completions",
+                                 json=self._text_body(request))
+                _raise_with_body(r)
+                j = r.json()
+            choice = (j.get("choices") or [{}])[0]
+            return _text_completion(model, choice.get("text") or "",
+                                    _clean_usage(j.get("usage") or {}),
+                                    choice.get("finish_reason") or "stop",
+                                    choice.get("logprobs"))
+        finally:
+            self._release(url)
+
     async def stream(self, request: dict):
-        """Yield ("delta", text) as the serve produces tokens, then
+        """Yield ("delta", delta_dict) as the serve produces tokens, then
         ("done", output) once with the assembled OpenAI-shaped body."""
         url = self._pick()
-        body = dict(request)
-        body["model"] = self.served_model or request.get("model")
-        body["stream"] = True
-        body.setdefault("stream_options", {"include_usage": True})
+        body = self._chat_body(request, stream=True)
         text_parts: list[str] = []
         usage: dict = {}
         finish = "stop"
         timeout = httpx.Timeout(self.read_timeout, connect=10.0)
+        reasoning_parts: list[str] = []
+        tool_calls: list = []
+        logprobs_seen = None
         try:
             async with httpx.AsyncClient(timeout=timeout) as c:
-                async with c.stream("POST", url + "/v1/chat/completions",
+                async with c.stream("POST", self._v1(url) + "/chat/completions",
                                     json=body) as r:
                     if r.status_code >= 400:
                         detail = (await r.aread()).decode("utf-8", "replace")
@@ -312,22 +586,40 @@ class Serve:
                         if ev.get("usage"):
                             usage = ev["usage"]
                         for ch in ev.get("choices") or []:
-                            piece = (ch.get("delta") or {}).get("content")
-                            if piece:
-                                text_parts.append(piece)
-                                yield "delta", piece
+                            d = ch.get("delta") or {}
+                            out = {}
+                            if d.get("content"):
+                                text_parts.append(d["content"])
+                                out["content"] = d["content"]
+                            # Reasoning deltas keep the stream from going silent
+                            # while the model thinks; tool_calls are essential
+                            # for agentic clients.
+                            if d.get("reasoning_content"):
+                                reasoning_parts.append(d["reasoning_content"])
+                                out["reasoning_content"] = d["reasoning_content"]
+                            if d.get("tool_calls"):
+                                tool_calls = _merge_tool_calls(
+                                    tool_calls, d["tool_calls"])
+                                out["tool_calls"] = d["tool_calls"]
+                            if ch.get("logprobs") is not None:
+                                logprobs_seen = ch["logprobs"]
+                            if out:
+                                yield "delta", out
                             if ch.get("finish_reason"):
                                 finish = ch["finish_reason"]
         finally:
             self._release(url)
 
-        text = "".join(text_parts)
-        yield "done", {
-            "choices": [{"index": 0, "finish_reason": finish,
-                         "message": {"role": "assistant", "content": text}}],
-            "usage": usage or {"prompt_tokens": 0,
-                               "completion_tokens": 0, "total_tokens": 0},
-        }
+        msg = {"role": "assistant", "content": "".join(text_parts)}
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        if reasoning_parts:
+            msg["reasoning_content"] = "".join(reasoning_parts)
+        yield "done", _chat_completion(
+            request.get("model"), _assistant_message(msg),
+            _clean_usage(usage) if usage else {
+                "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            finish, logprobs_seen)
 
 
 # --------------------------------------------------------------------- session
@@ -337,12 +629,19 @@ async def _serve_one(ws, frame, backend: Serve, load: Load):
     rid = request.get("engy_request_id") or uuid.uuid4().hex
     load.start()
     try:
-        async for kind, payload in backend.stream(request):
-            if kind == "delta":
-                await ws.send(json.dumps(P.chunk(corr, {"content": payload})))
-            else:
-                await ws.send(json.dumps(
-                    P.response(corr, rid, {}, output=payload)))
+        if is_text_completion(request):
+            # Both raw-completion lanes answer in one shot. Streaming a span
+            # score is meaningless: max_tokens is 0 and the payload is the
+            # logprob array, not tokens.
+            output = await backend.complete(request)
+            await ws.send(json.dumps(P.response(corr, rid, {}, output=output)))
+        else:
+            async for kind, payload in backend.stream(request):
+                if kind == "delta":
+                    await ws.send(json.dumps(P.chunk(corr, payload)))
+                else:
+                    await ws.send(json.dumps(
+                        P.response(corr, rid, {}, output=payload)))
     except asyncio.CancelledError:
         # The buyer is gone. Unwinding here tears down the upstream stream,
         # which makes the engine abort the generation and free the KV slot.
