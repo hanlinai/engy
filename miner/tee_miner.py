@@ -478,6 +478,17 @@ async def _leg(i: int, n: int, cfg, cap, load: Load):
         await asyncio.sleep(0.5)
 
 
+def _split_capacity(capacity: dict, n: int) -> dict:
+    """Per-leg capacity for an n-leg dial: each leg enforces its share of
+    max_inflight. Ceil, so the legs together never advertise less than the
+    real total."""
+    if n <= 1 or not capacity.get("max_inflight"):
+        return capacity
+    cap = dict(capacity)
+    cap["max_inflight"] = -(-int(cap["max_inflight"]) // n)
+    return cap
+
+
 def _worker_count(gw: str) -> int:
     """One leg per gateway worker process, so we receive all buyer traffic; a
     single-dial miner only ever lands on worker 0."""
@@ -559,11 +570,18 @@ def main(argv=None):
     }
 
     n = _worker_count(cfg["gw"])
+    # Each leg advertises its SHARE of max_inflight, not the whole thing. One
+    # leg per gateway worker, so advertising the full value on every leg tells
+    # the gateway this worker can take n times what it can, and the surplus
+    # arrives as a burst the engine has no slots for. Ceil, so the legs together
+    # never advertise less than the real total.
+    cap = _split_capacity(cap, n)
     load = Load()
     print(f"[tee_miner] dialing {n} leg(s) of {cfg['gw']} as {cfg['model']} "
           f"worker={worker_name} worker_id={worker_id}"
           f"{'' if assigned else ' (MINTED, not provider-assigned)'} "
-          f"root={cfg['model_root'][:12]} serves={serve_urls}", flush=True)
+          f"root={cfg['model_root'][:12]} serves={serve_urls} "
+          f"leg_inflight={cap['max_inflight']}", flush=True)
     hw = cfg["hw"]
     print(f"[tee_miner] hw: {hw.get('gpus')} | {hw.get('gpu_mem_gb')}GB/gpu | "
           f"{hw.get('cpus')} cpu | {hw.get('ram_gb')}GB ram | "
