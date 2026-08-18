@@ -328,10 +328,10 @@ def is_span_scoring(request: dict) -> bool:
     `logprob_start_len` is a native /generate parameter; the OpenAI
     /v1/completions surface has no equivalent, which is why `echo` there is
     all-or-nothing. That all-or-nothing behaviour is what makes long-prefix
-    scoring fatal: `echo` materialises a [prompt_tokens x vocab] fp32 logits
-    tensor (roughly 0.6 MB per prompt token on GLM-5.2), so a 20k prefix wants
-    about 11.5 GiB while only a few hundred MiB is free at mem-fraction 0.80.
-    Scoring a span costs scored_tokens x vocab x 4 instead."""
+    scoring expensive: `echo` materialises a logits tensor over the WHOLE
+    prompt, so its cost scales with the prefix and can exceed the memory a
+    backend has left. Scoring a span costs scored_tokens x vocab x 4 instead,
+    which is bounded by the span rather than by the prompt."""
     return request.get("logprob_start_len") is not None
 
 
