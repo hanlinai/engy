@@ -780,7 +780,8 @@ async def _leg(i: int, n: int, cfg, cap, load: Load):
 def _split_capacity(capacity: dict, n: int) -> dict:
     """Per-leg capacity for an n-leg dial: each leg enforces its share of
     max_inflight. Ceil, so the legs together never advertise less than the
-    real total."""
+    real total. max_inflight_total is deliberately left untouched: it is the
+    node-wide ceiling and every leg must carry it at full value."""
     if n <= 1 or not capacity.get("max_inflight"):
         return capacity
     cap = dict(capacity)
@@ -850,7 +851,14 @@ def main(argv=None):
             sys.exit(msg.replace("It will serve, but it", "Refusing to start: it"))
         print("[tee_miner] WARNING: " + msg, flush=True)
 
-    cap = {"max_inflight": args.max_inflight}
+    cap = {"max_inflight": args.max_inflight,
+           # The gateway requires BOTH numbers and denies a HELLO carrying only
+           # the split ("capacity.max_inflight_total not declared"). They answer
+           # different questions: max_inflight is this leg's share, while
+           # max_inflight_total is what the whole node can take at once, so it
+           # is carried UNDIVIDED on every leg and lets the gateway keep the sum
+           # of the legs from exceeding the backend.
+           "max_inflight_total": args.max_inflight}
     if args.context_length:
         cap["context_length"] = args.context_length
     # Shape limits (max_input_tokens / max_output_tokens / max_request_s) are
@@ -880,7 +888,8 @@ def main(argv=None):
           f"worker={worker_name} worker_id={worker_id}"
           f"{'' if assigned else ' (MINTED, not provider-assigned)'} "
           f"root={cfg['model_root'][:12]} serves={serve_urls} "
-          f"leg_inflight={cap['max_inflight']}", flush=True)
+          f"leg_inflight={cap['max_inflight']} "
+          f"node_inflight={cap['max_inflight_total']}", flush=True)
     hw = cfg["hw"]
     print(f"[tee_miner] hw: {hw.get('gpus')} | {hw.get('gpu_mem_gb')}GB/gpu | "
           f"{hw.get('cpus')} cpu | {hw.get('ram_gb')}GB ram | "
