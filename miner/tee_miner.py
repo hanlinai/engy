@@ -850,7 +850,11 @@ def main(argv=None):
             sys.exit(msg.replace("It will serve, but it", "Refusing to start: it"))
         print("[tee_miner] WARNING: " + msg, flush=True)
 
-    cap = {"max_inflight": args.max_inflight}
+    cap = {"max_inflight": args.max_inflight,
+           # Rides undivided past _split_capacity: the gateway routes on the
+           # per-leg share but records the total on the worker, and denies the
+           # HELLO outright ("capacity.max_inflight_total not declared").
+           "max_inflight_total": args.max_inflight}
     if args.context_length:
         cap["context_length"] = args.context_length
     # Shape limits (max_input_tokens / max_output_tokens / max_request_s) are
