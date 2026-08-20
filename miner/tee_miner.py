@@ -35,7 +35,17 @@ Configuration:
   ENGY_MAX_INFLIGHT    concurrent requests this worker accepts (default 32)
   ENGY_CONTEXT_LENGTH  advertised context window
   ENGY_READ_TIMEOUT    upstream read timeout, seconds (default 1800)
+  ENGY_HEARTBEAT_S     seconds between heartbeats (default 30). Each heartbeat
+                       also carries live KV-cache pressure (see below); the
+                       gateway's KV full-load gate wants a report fresher than
+                       its TTL (~15s), so set this to ~10 or less to use it.
   ENGY_GPUS / ENGY_PARALLELISM / ENGY_REGION   hardware descriptors
+
+Every heartbeat reports live KV-cache pressure, read from the local serve's
+sglang `/get_load` (occupied vs `max_total_num_tokens`) — so the gateway can
+judge this worker "full" on KV as well as in-flight count. A serve that does not
+expose `/get_load` (older sglang / vLLM) simply omits it, and the gateway falls
+back to in-flight alone.
 
 Run:
 
@@ -90,11 +100,13 @@ class P:
         return f
 
     @staticmethod
-    def heartbeat(inflight=0, idle_seconds=0.0, capacity=None):
+    def heartbeat(inflight=0, idle_seconds=0.0, capacity=None, kv=None):
         f = {"type": P.HEARTBEAT, "inflight": inflight,
              "idle_seconds": idle_seconds}
         if capacity:
             f["capacity"] = capacity
+        if kv is not None:                 # live KV-cache pressure (optional)
+            f["kv"] = kv
         return f
 
     @staticmethod
@@ -426,6 +438,7 @@ class Serve:
         self.served_model = served_model
         self.read_timeout = read_timeout
         self._n = {u: 0 for u in urls}
+        self._mtt: dict[str, int | None] = {}   # per-serve KV pool size, cached
 
     def _pick(self) -> str:
         u = min(self.urls, key=lambda s: self._n.get(s, 0))
@@ -434,6 +447,63 @@ class Serve:
 
     def _release(self, u: str):
         self._n[u] = max(0, self._n.get(u, 0) - 1)
+
+    async def _max_total(self, c, root: str) -> int | None:
+        """KV pool size of the serve at `root` (max_total_num_tokens), cached —
+        it is fixed for the life of the serve."""
+        if root not in self._mtt:
+            try:
+                r = await c.get(root + "/get_server_info")
+                r.raise_for_status()
+                self._mtt[root] = int(r.json().get("max_total_num_tokens") or 0) or None
+            except Exception:
+                self._mtt[root] = None
+        return self._mtt[root]
+
+    async def kv_load(self) -> dict | None:
+        """Live KV-cache pressure across the local serve(s): tokens occupied vs
+        the pool size, summed over every scheduler of every serve url, from
+        sglang `/get_load` + `max_total_num_tokens`. Cheap (two GETs) and never
+        raises. Returns None if no serve exposes `/get_load` (older sglang /
+        vLLM) — the gateway then judges this worker on in-flight count alone."""
+        used = reqs = waiting = pending = ranks = 0
+        limit = 0
+        got = False
+        try:
+            timeout = httpx.Timeout(4.0, connect=3.0)
+            async with httpx.AsyncClient(timeout=timeout) as c:
+                for u in self.urls:
+                    root = self._root(u)
+                    try:
+                        r = await c.get(root + "/get_load")
+                        r.raise_for_status()
+                        load = r.json()
+                    except Exception:
+                        continue
+                    if not isinstance(load, list) or not load:
+                        continue
+                    mtt = await self._max_total(c, root)
+                    for x in load:
+                        if not isinstance(x, dict):
+                            continue
+                        used += int(x.get("num_tokens", 0) or 0)
+                        reqs += int(x.get("num_reqs", 0) or 0)
+                        waiting += int(x.get("num_waiting_reqs", 0) or 0)
+                        pending += int(x.get("num_pending_tokens", 0) or 0)
+                        ranks += 1
+                        if mtt:
+                            limit += int(mtt)
+                    got = True
+        except Exception:
+            return None
+        if not got:
+            return None
+        kv = {"used": used, "reqs": reqs, "waiting": waiting,
+              "pending": pending, "ranks": ranks}
+        if limit:
+            kv["limit"] = limit
+            kv["frac"] = round(used / limit, 4) if limit else None
+        return kv
 
     @staticmethod
     def _root(url: str) -> str:
@@ -658,13 +728,14 @@ async def _serve_one(ws, frame, backend: Serve, load: Load):
         load.done()
 
 
-async def _heartbeat(ws, interval: float, load: Load, cap: dict):
+async def _heartbeat(ws, interval: float, load: Load, cap: dict, backend=None):
     try:
         while True:
             await asyncio.sleep(interval)
+            kv = await backend.kv_load() if backend is not None else None
             await ws.send(json.dumps(P.heartbeat(
                 inflight=load.inflight, idle_seconds=load.idle_seconds(),
-                capacity=cap)))
+                capacity=cap, kv=kv)))
     except (websockets.ConnectionClosed, asyncio.CancelledError):
         pass
 
@@ -703,7 +774,8 @@ async def _session(ws, cfg, cap, load: Load, tag: str) -> bool:
         worker_id=cfg["worker_id"])))
     print(f"[tee_miner] {tag} HELLO sent (max_inflight={cap['max_inflight']})",
           flush=True)
-    hb = asyncio.create_task(_heartbeat(ws, 30.0, load, cap))
+    hb = asyncio.create_task(
+        _heartbeat(ws, cfg.get("hb_s", 30.0), load, cap, cfg["backend"]))
     serving: dict[str, asyncio.Task] = {}
     drained = False
     try:
@@ -874,6 +946,7 @@ def main(argv=None):
         "model_root": _model_root(args.checkpoint),
         "hw": _detect_hw(),
         "backend": Serve(serve_urls, args.served_model, args.read_timeout),
+        "hb_s": float(_env("ENGY_HEARTBEAT_S", "30")),
     }
 
     n = _worker_count(cfg["gw"])
