@@ -758,7 +758,13 @@ async def _leg(i: int, n: int, cfg, cap, load: Load):
         try:
             ws = await websockets.connect(
                 url, ping_interval=15, ping_timeout=60,
-                close_timeout=10, max_queue=128)
+                close_timeout=10, max_queue=128,
+                # websockets caps inbound frames at 1 MiB by default, which is
+                # smaller than a long-context request: ~156k prompt tokens is
+                # already ~1 MiB of JSON. The oversized frame closes the
+                # session, so the gateway books the worker as timed out and
+                # answers 504 for a request the serve never even received.
+                max_size=64 * 1024 * 1024)
             drained = await _session(ws, cfg, cap, load, tag)
             if drained:
                 # _retire owns the socket now. Re-dial immediately so the
