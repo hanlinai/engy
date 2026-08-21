@@ -110,6 +110,44 @@ class P:
         return f
 
 
+# sglang reports a payload IT could not decode as 500, but a truncated base64
+# image is the BUYER's bytes, not a fault of this worker: the same request fails
+# the same way on every miner. Relaying it as 500 makes the gateway emit an
+# opaque 502, hides the real cause from the buyer, and charges the miss to our
+# HTTP success rate at the 99% qualification gate. Narrow on purpose -- only
+# messages that can originate in the request body are re-labelled, so a genuine
+# engine fault still surfaces as the upstream failure it is.
+_CLIENT_PAYLOAD_500 = (
+    "while loading image data",
+    "while loading data imagedata(",
+    "while loading data audiodata(",
+    "while loading data videodata(",
+    "broken data stream when reading image file",
+    "cannot identify image file",
+)
+
+
+def _client_facing_status(status: int, detail: str) -> int:
+    if status == 500 and any(p in detail.lower() for p in _CLIENT_PAYLOAD_500):
+        return 400
+    return status
+
+
+class ServeError(RuntimeError):
+    """A non-2xx from the local serve, keeping the status for the gateway.
+
+    The gateway honours a 4xx in the error frame and relays it verbatim, so a
+    request the BUYER malformed (empty messages, top_p=2.0) comes back as that
+    4xx instead of a generic 502 that reads as our fault -- and, more to the
+    point, stops counting against the worker's HTTP success rate at the
+    qualification gate.
+    """
+
+    def __init__(self, status: int, detail: str):
+        super().__init__(f"serve {status}: {detail}")
+        self.status = status
+
+
 def _env(key, default=None):
     v = os.environ.get(key)
     return v if v not in (None, "") else default
@@ -287,7 +325,7 @@ def _raise_with_body(r) -> None:
         detail = r.text
     except Exception:
         detail = ""
-    raise RuntimeError(f"serve {r.status_code}: {detail[:1000]}")
+    raise ServeError(_client_facing_status(r.status_code, detail), detail[:1000])
 
 
 def _merge_tool_calls(acc: list, deltas: list) -> list:
@@ -571,8 +609,9 @@ class Serve:
                                     json=body) as r:
                     if r.status_code >= 400:
                         detail = (await r.aread()).decode("utf-8", "replace")
-                        raise RuntimeError(
-                            f"serve {r.status_code}: {detail[:600]}")
+                        raise ServeError(
+                            _client_facing_status(r.status_code, detail),
+                            detail[:600])
                     async for line in r.aiter_lines():
                         if not line.startswith("data:"):
                             continue
@@ -650,7 +689,8 @@ async def _serve_one(ws, frame, backend: Serve, load: Load):
         try:
             await ws.send(json.dumps(P.response(
                 corr, rid, {}, error={"message": str(e)[:500],
-                                      "type": type(e).__name__})))
+                                      "type": type(e).__name__,
+                                      "status": getattr(e, "status", None)})))
         except Exception:
             pass
         print(f"[tee_miner] serve error: {e!r}", flush=True)
