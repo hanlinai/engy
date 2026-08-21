@@ -98,8 +98,11 @@ class P:
         return f
 
     @staticmethod
-    def chunk(corr_id, delta=None):
-        return {"type": P.CHUNK, "corr_id": corr_id, "delta": delta or {}}
+    def chunk(corr_id, delta=None, logprobs=None):
+        f = {"type": P.CHUNK, "corr_id": corr_id, "delta": delta or {}}
+        if logprobs is not None:
+            f["logprobs"] = logprobs
+        return f
 
     @staticmethod
     def response(corr_id, request_id, commitment, output=None, error=None):
@@ -464,11 +467,31 @@ class Serve:
         self.served_model = served_model
         self.read_timeout = read_timeout
         self._n = {u: 0 for u in urls}
+        self._down: set[str] = set()
 
     def _pick(self) -> str:
-        u = min(self.urls, key=lambda s: self._n.get(s, 0))
+        pool = [u for u in self.urls if u not in self._down] or self.urls
+        u = min(pool, key=lambda s: self._n.get(s, 0))
         self._n[u] = self._n.get(u, 0) + 1
         return u
+
+    async def healthy(self, timeout: float = 8.0) -> bool:
+        """Can at least one serve actually decode? sglang's /health returns
+        non-200 when the scheduler/detokenizer is hung and refuses the
+        connection when the process died (OOM crash) — the real signal a fake
+        heartbeat lacks. Also refreshes the down-set `_pick` routes around."""
+        down: set[str] = set()
+        async with httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout, connect=4.0)) as c:
+            for u in self.urls:
+                try:
+                    ok = (await c.get(self._root(u) + "/health")).status_code == 200
+                except Exception:
+                    ok = False
+                if not ok:
+                    down.add(u)
+        self._down = down
+        return len(down) < len(self.urls)
 
     def _release(self, u: str):
         self._n[u] = max(0, self._n.get(u, 0) - 1)
@@ -643,7 +666,11 @@ class Serve:
                             if ch.get("logprobs") is not None:
                                 logprobs_seen = ch["logprobs"]
                             if out:
-                                yield "delta", out
+                                # choice-level logprobs ride beside the delta so
+                                # a streaming buyer gets them per chunk, not
+                                # just on the terminal frame
+                                yield "delta", {"delta": out,
+                                                "logprobs": ch.get("logprobs")}
                             if ch.get("finish_reason"):
                                 finish = ch["finish_reason"]
         finally:
@@ -677,7 +704,9 @@ async def _serve_one(ws, frame, backend: Serve, load: Load):
         else:
             async for kind, payload in backend.stream(request):
                 if kind == "delta":
-                    await ws.send(json.dumps(P.chunk(corr, payload)))
+                    await ws.send(json.dumps(P.chunk(
+                        corr, payload["delta"],
+                        logprobs=payload.get("logprobs"))))
                 else:
                     await ws.send(json.dumps(
                         P.response(corr, rid, {}, output=payload)))
@@ -834,18 +863,111 @@ def _split_capacity(capacity: dict, n: int) -> dict:
     return cap
 
 
-def _worker_count(gw: str) -> int:
+def _fetch_worker_count(gw: str) -> int | None:
     """One leg per gateway worker process, so we receive all buyer traffic; a
-    single-dial miner only ever lands on worker 0."""
+    single-dial miner only ever lands on worker 0.
+
+    Returns None (not 1) when /gw/meta is unreachable, so the supervisor KEEPS
+    the current count on a transient failure instead of collapsing a live
+    multi-worker miner to a single leg — dropping legs 1..N-1 504s their
+    in-flight streams and sheds capacity (measured on the reference miner:
+    under load the sole /gw/meta responder CPU-saturates, the GET times out,
+    and the fallback-to-1 flapping cost ~60% of fleet throughput)."""
     n = _env("ENGY_GW_WORKERS")
     if n:
         return max(1, int(n))
     try:
         meta = gw.replace("wss://", "https://").replace("ws://", "http://") + "/meta"
         r = httpx.get(meta, timeout=5.0)
-        return max(1, int((r.json() or {}).get("workers") or 1))
+        r.raise_for_status()
+        return max(1, min(int((r.json() or {}).get("workers") or 1), 64))
     except Exception:
-        return 1
+        return None
+
+
+# How often the supervisor re-reads /gw/meta so a gateway worker-count change
+# (a scale event) is picked up without a miner restart, and re-probes the
+# serve's /health.
+META_RECHECK_S = 5.0
+# Backend health gate: an OOM/hang is detected within ~META_RECHECK_S and every
+# leg drops so the gateway routes buyers elsewhere; _HEALTH_OK_STREAK
+# consecutive good probes are required before reconnecting, to ride out a
+# flapping/relaunching backend.
+_HEALTH_OK_STREAK = 2
+
+
+async def _supervise(cfg, capacity: dict, load: Load):
+    """Leg supervisor, ported from the reference miner.
+
+    Two jobs beyond keeping N legs dialed:
+    - Backend health gate: when the serve OOMs or wedges, DISCONNECT every leg
+      so the gateway stops routing buyers here (the alternative is advertising
+      a dead backend and 502ing everything). Reconnect only after
+      _HEALTH_OK_STREAK consecutive good probes.
+    - Incremental leg management keyed by worker INDEX: a gateway scale event
+      adds legs for new workers and drops legs for removed ones, but never
+      touches an existing leg — cancelling a live leg 504s its streams.
+    """
+    backend: Serve = cfg["backend"]
+    legs: dict[int, asyncio.Task] = {}
+    cur_n = 0
+    # Startup bootstrap: retry /gw/meta before committing, so leg 0 is created
+    # with the split for the REAL worker count. Existing legs keep their
+    # capacity, so a wrong first split would stick.
+    fetched = None
+    for _ in range(3):
+        fetched = await asyncio.to_thread(_fetch_worker_count, cfg["gw"])
+        if fetched is not None:
+            break
+        await asyncio.sleep(1.0)
+    backend_down = False
+    ok_streak = 0
+    try:
+        while True:
+            ok = await backend.healthy()
+            if ok:
+                ok_streak += 1
+                if backend_down and ok_streak >= _HEALTH_OK_STREAK:
+                    backend_down = False
+                    print("[tee_miner] backend RECOVERED — reconnecting legs",
+                          flush=True)
+            else:
+                ok_streak = 0
+                if not backend_down:
+                    backend_down = True
+                    print("[tee_miner] backend UNHEALTHY (OOM/unreachable) — "
+                          "disconnecting all legs", flush=True)
+            if backend_down:
+                if legs:
+                    for t in legs.values():
+                        t.cancel()
+                    await asyncio.gather(*legs.values(), return_exceptions=True)
+                    legs.clear()
+                    cur_n = 0
+                await asyncio.sleep(META_RECHECK_S)
+                continue
+            # KEEP the current count on a transient meta failure (None); fall
+            # back to 1 only at startup, when no count has ever resolved.
+            n = fetched if fetched is not None else (cur_n or 1)
+            if n != cur_n or any(t.done() for t in legs.values()):
+                cap = _split_capacity(capacity, n)
+                for i in range(n):              # add missing / dead legs
+                    if i not in legs or legs[i].done():
+                        legs[i] = asyncio.create_task(_leg(i, n, cfg, cap, load))
+                for i in [i for i in legs if i >= n]:   # drop removed workers
+                    legs[i].cancel()
+                    legs.pop(i)
+                if cur_n and n != cur_n:
+                    print(f"[tee_miner] worker count {cur_n} -> {n} "
+                          f"({'added' if n > cur_n else 'removed'} legs, "
+                          "existing kept)", flush=True)
+                cur_n = n
+            await asyncio.sleep(META_RECHECK_S)
+            fetched = await asyncio.to_thread(_fetch_worker_count, cfg["gw"])
+    finally:
+        for t in legs.values():
+            t.cancel()
+        await asyncio.gather(*legs.values(), return_exceptions=True)
 
 
 # ------------------------------------------------------------------------ main
@@ -876,6 +998,9 @@ def main(argv=None):
                    default=int(_env("ENGY_CONTEXT_LENGTH", "0")) or None)
     p.add_argument("--read-timeout", type=float,
                    default=float(_env("ENGY_READ_TIMEOUT", "1800")))
+    p.add_argument("--modalities", default=_env("ENGY_MODALITIES", "text"),
+                   help="comma-separated input modalities the serve accepts, "
+                        "e.g. 'text,image' for a VLM serve (default: text)")
     p.add_argument("--require-tee-identity", action="store_true",
                    default=_env("ENGY_REQUIRE_TEE_IDENTITY") == "1",
                    help="exit rather than serve without a provider-assigned "
@@ -903,6 +1028,9 @@ def main(argv=None):
            "max_inflight_total": args.max_inflight}
     if args.context_length:
         cap["context_length"] = args.context_length
+    mods = [s.strip() for s in (args.modalities or "").split(",") if s.strip()]
+    if mods and mods != ["text"]:       # text-only is the registry default
+        cap["input_modalities"] = mods
     # Shape limits (max_input_tokens / max_output_tokens / max_request_s) are
     # operator-owned per-model spec, injected by the gateway from the models
     # table. Self-reported values for those keys are ignored, so we omit them.
@@ -918,19 +1046,17 @@ def main(argv=None):
         "backend": Serve(serve_urls, args.served_model, args.read_timeout),
     }
 
-    n = _worker_count(cfg["gw"])
-    # Each leg advertises its SHARE of max_inflight, not the whole thing. One
-    # leg per gateway worker, so advertising the full value on every leg tells
-    # the gateway this worker can take n times what it can, and the surplus
-    # arrives as a burst the engine has no slots for. Ceil, so the legs together
-    # never advertise less than the real total.
-    cap = _split_capacity(cap, n)
+    # The supervisor splits max_inflight per leg (each leg advertises its SHARE,
+    # not the whole thing — advertising the full value on every leg tells the
+    # gateway this worker can take n times what it can), re-reads the worker
+    # count for scale events, and health-gates the legs on the serve's /health.
     load = Load()
-    print(f"[tee_miner] dialing {n} leg(s) of {cfg['gw']} as {cfg['model']} "
+    print(f"[tee_miner] supervising legs of {cfg['gw']} as {cfg['model']} "
           f"worker={worker_name} worker_id={worker_id}"
           f"{'' if assigned else ' (MINTED, not provider-assigned)'} "
           f"root={cfg['model_root'][:12]} serves={serve_urls} "
-          f"leg_inflight={cap['max_inflight']}", flush=True)
+          f"total_inflight={cap['max_inflight']} "
+          f"modalities={mods or ['text']}", flush=True)
     hw = cfg["hw"]
     print(f"[tee_miner] hw: {hw.get('gpus')} | {hw.get('gpu_mem_gb')}GB/gpu | "
           f"{hw.get('cpus')} cpu | {hw.get('ram_gb')}GB ram | "
@@ -938,10 +1064,7 @@ def main(argv=None):
           f"multigpu={hw.get('tee', {}).get('gpu_cc_multigpu', '?')}",
           flush=True)
 
-    async def _run_all():
-        await asyncio.gather(*[_leg(i, n, cfg, cap, load) for i in range(n)])
-
-    asyncio.run(_run_all())
+    asyncio.run(_supervise(cfg, cap, load))
 
 
 if __name__ == "__main__":
