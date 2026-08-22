@@ -15,6 +15,7 @@ from validator.schedule import BLOCK_S, RESUBMIT_BLOCKS
 from validator.sync import epoch_message, MAX_RESPONSE_BYTES
 from validator.validator import (
     tick, _heartbeat_age, _watchdog_check, stall_limit, healthcheck,
+    _default_chain,
 )
 
 GENESIS = 1784505600
@@ -87,6 +88,17 @@ def _cfg(tmp_path):
             "wallet": "w", "wallet_hotkey": "hk", "poll_s": 300,
             "state_file": str(tmp_path / "state.json"),
             "heartbeat_file": str(tmp_path / "heartbeat.json")}
+
+
+def test_the_default_chain_is_one_reused_persistent_connection():
+    # When the loop does not inject a chain it must fall back to a single
+    # reused ChainClient, not a fresh connection per tick — otherwise the
+    # per-tick websocket leak the fix removes would come straight back through
+    # the fallback path.
+    a = _default_chain()
+    b = _default_chain()
+    assert isinstance(a, chain_mod.ChainClient)
+    assert a is b
 
 
 class FakeChain:

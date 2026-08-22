@@ -153,6 +153,21 @@ def healthcheck() -> None:
     print(f"ok (last tick {age:.0f}s ago)")
 
 
+# The chain connection is a single persistent websocket reused for the whole
+# process (see chain.ChainClient), not a fresh one per tick. main() drives the
+# loop with this same instance; the lazy singleton also backs any tick() that
+# does not inject its own chain, so the fallback path cannot reintroduce the
+# per-tick connection leak the old per-tick open_chain caused.
+_shared_chain = None
+
+
+def _default_chain():
+    global _shared_chain
+    if _shared_chain is None:
+        _shared_chain = _chain.ChainClient()
+    return _shared_chain
+
+
 def tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
          chain=None) -> str:
     """Run one poll cycle, stamping the heartbeat however it turns out.
@@ -247,7 +262,7 @@ def _standby_vector(chain, state: dict, hotkeys_on_chain: list[str], *,
 
 def _run_tick(cfg: dict, *, now: float, client: httpx.Client | None = None,
               chain=None) -> str:
-    chain = chain or _chain
+    chain = chain if chain is not None else _default_chain()
     state = read_state(cfg["state_file"])
     applied = last_applied(state)
 
@@ -389,16 +404,21 @@ def main() -> None:
         print(f"[heartbeat] wallet load failed ({type(e).__name__}: {e}); "
               f"provider heartbeat disabled", flush=True)
         hb_keypair = None
+    # One persistent chain connection for the whole run, reused every tick and
+    # closed on the way out so its websocket does not linger.
+    chain = _default_chain()
     try:
         while True:
             try:
-                tick(cfg, now=time.time())
+                tick(cfg, now=time.time(), chain=chain)
             except Exception as e:
                 print(f"[sync] tick error: {e}", flush=True)
             emit_provider_heartbeat(cfg, hb_keypair, version)
             time.sleep(cfg["poll_s"])
     except KeyboardInterrupt:
         pass
+    finally:
+        chain.close()
 
 
 if __name__ == "__main__":

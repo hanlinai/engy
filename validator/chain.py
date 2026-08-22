@@ -68,14 +68,6 @@ def _valid_block(b) -> int | None:
     return b if isinstance(b, int) and not isinstance(b, bool) and b > 0 else None
 
 
-def open_chain(*, network: str, netuid: int) -> ChainView:
-    """Connect and read the metagraph and current block. Raises on failure."""
-    import bittensor as bt
-    sub = bt.Subtensor(network=network)
-    meta = sub.metagraph(netuid)
-    return ChainView(sub=sub, hotkeys=list(meta.hotkeys), block=_read_block(sub))
-
-
 def _read_block(sub) -> int | None:
     """The block number is a scheduling nicety, not a prerequisite — a failure
     here degrades to the wall-clock fallback instead of losing the tick."""
@@ -165,3 +157,76 @@ def set_weights(view: ChainView, *, wallet: str, wallet_hotkey: str, netuid: int
         # from reading as a chain outage.
         print(f"[chain] set_weights failed ({type(e).__name__}: {e})", flush=True)
         return False
+
+
+def _close_sub(sub) -> None:
+    """Tear down a bittensor Subtensor's async websocket.
+
+    async_substrate_interface keeps the socket (and its event loop) alive after
+    the last Python reference drops, so dropping `sub` is not enough — both the
+    substrate connection and the subtensor must be closed explicitly, or the
+    socket lingers ESTAB until the server reaps it. Best-effort: a close path
+    that raises must not stop the other, and a teardown failure never matters
+    to the loop.
+    """
+    for closer in (lambda: sub.substrate.close(), lambda: sub.close()):
+        try:
+            closer()
+        except Exception:
+            pass
+
+
+class ChainClient:
+    """One long-lived chain connection, reused across ticks.
+
+    open_chain() used to build a fresh bt.Subtensor every tick and never close
+    it, so the websockets to the entrypoint piled up until the endpoint
+    rate-limited the IP (HTTP 429). This holds a single connection instead:
+    each tick takes a fresh metagraph snapshot on it (same per-tick freshness),
+    and a new socket is opened only when a snapshot fails — with the old one
+    always closed first, so at most one connection is ever live.
+
+    Interface mirrors the module functions so it drops into the same seam the
+    loop already injects (see validator._run_tick).
+    """
+
+    def __init__(self):
+        self._sub = None
+
+    def _connect(self, network: str):
+        import bittensor as bt
+        self._sub = bt.Subtensor(network=network)
+
+    def open_chain(self, *, network: str, netuid: int) -> ChainView:
+        """Fresh snapshot on the held connection, reconnecting once on failure.
+
+        A held connection can go stale (dropped, or rate-limited into refusing
+        the read), which surfaces as an error from connect or metagraph. Rather
+        than propagate a transient failure, drop the bad connection — closing it
+        so it cannot leak — and try once more on a fresh one. Only a second
+        failure propagates, and it leaves nothing held: at most one connection
+        is ever live, even through a sustained outage.
+        """
+        last_err: Exception | None = None
+        for _ in range(2):
+            try:
+                if self._sub is None:
+                    self._connect(network)
+                meta = self._sub.metagraph(netuid)
+                block = _read_block(self._sub)
+                return ChainView(sub=self._sub, hotkeys=list(meta.hotkeys),
+                                 block=block)
+            except Exception as e:
+                last_err = e
+                self.close()  # drop + close the bad connection before retrying
+        raise last_err
+
+    def close(self) -> None:
+        if self._sub is not None:
+            _close_sub(self._sub)
+            self._sub = None
+
+    resolve_uids = staticmethod(resolve_uids)
+    skipped_hotkeys = staticmethod(skipped_hotkeys)
+    dropped_weight_share = staticmethod(dropped_weight_share)
+    set_weights = staticmethod(set_weights)
