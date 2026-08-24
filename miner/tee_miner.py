@@ -476,19 +476,39 @@ class Serve:
         return u
 
     async def healthy(self, timeout: float = 8.0) -> bool:
-        """Can at least one serve actually decode? sglang's /health returns
-        non-200 when the scheduler/detokenizer is hung and refuses the
-        connection when the process died (OOM crash) — the real signal a fake
-        heartbeat lacks. Also refreshes the down-set `_pick` routes around."""
+        """Can at least one serve actually decode? Exactly two outcomes mean it
+        cannot, and NEITHER of them is a timeout: sglang answers non-200 when
+        the scheduler/detokenizer is hung, and the connection is refused or
+        reset when the process died (OOM crash). Both are unambiguous and both
+        come back immediately, so this needs no timeout tuning to be correct.
+
+        A timeout means the opposite of sickness: the process accepted the
+        connection and is merely too busy to answer. Counting it as unhealthy —
+        which a bare `except Exception` does — withdraws a HEALTHY worker
+        exactly when the fleet is busiest, and withdraws every worker at once,
+        because they are all busy with the same spike: the load one sheds lands
+        on the next and takes that one down too. Measured on kimi-k3 2026-08-23:
+        a 10x request-rate spike (20 -> 273 req/min, no oversized prompts) took
+        three workers down in sequence, one per minute, costing ~200 requests.
+        No timeout is large enough to fix that — one legitimate 600k-token
+        prefill blocks sglang's HTTP layer for 20-34 s — and across 8545 probes
+        on that box not one ever returned non-200 or found the port closed.
+
+        Also refreshes the down-set `_pick` routes around."""
         down: set[str] = set()
         async with httpx.AsyncClient(
                 timeout=httpx.Timeout(timeout, connect=4.0)) as c:
             for u in self.urls:
                 try:
-                    ok = (await c.get(self._root(u) + "/health")).status_code == 200
+                    dead = (await c.get(self._root(u) + "/health")
+                            ).status_code != 200
+                except httpx.TimeoutException:
+                    dead = False        # alive, saturated: not a failure
+                except (httpx.NetworkError, httpx.RemoteProtocolError):
+                    dead = True         # port closed / reset: the process is gone
                 except Exception:
-                    ok = False
-                if not ok:
+                    dead = False        # unknown: fail open, never invent an outage
+                if dead:
                     down.add(u)
         self._down = down
         return len(down) < len(self.urls)
