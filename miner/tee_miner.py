@@ -478,43 +478,55 @@ class Serve:
         self._n[u] = self._n.get(u, 0) + 1
         return u
 
-    async def healthy(self, timeout: float = 8.0) -> bool:
-        """Can at least one serve actually decode? Exactly two outcomes mean it
-        cannot, and NEITHER of them is a timeout: sglang answers non-200 when
-        the scheduler/detokenizer is hung, and the connection is refused or
-        reset when the process died (OOM crash). Both are unambiguous and both
-        come back immediately, so this needs no timeout tuning to be correct.
+    async def probe(self, timeout: float = 8.0) -> str:
+        """Backend liveness, as one of 'ok' | 'dead' | 'timeout'.
 
-        A timeout means the opposite of sickness: the process accepted the
-        connection and is merely too busy to answer. Counting it as unhealthy —
-        which a bare `except Exception` does — withdraws a HEALTHY worker
-        exactly when the fleet is busiest, and withdraws every worker at once,
-        because they are all busy with the same spike: the load one sheds lands
-        on the next and takes that one down too. Measured on kimi-k3 2026-08-23:
-        a 10x request-rate spike (20 -> 273 req/min, no oversized prompts) took
-        three workers down in sequence, one per minute, costing ~200 requests.
-        No timeout is large enough to fix that — one legitimate 600k-token
-        prefill blocks sglang's HTTP layer for 20-34 s — and across 8545 probes
-        on that box not one ever returned non-200 or found the port closed.
+        The three outcomes are genuinely different and the caller must treat
+        them differently:
 
-        Also refreshes the down-set `_pick` routes around."""
+        - 'dead'    the connection is refused/reset, or /health answers non-200.
+                    Unambiguous, and both come back in milliseconds: the process
+                    is gone, or sglang is telling us its scheduler/detokenizer
+                    is hung. Act immediately.
+        - 'timeout' /health accepted the connection and did not answer in time.
+                    This is NOT proof of anything on its own. sglang's /health
+                    round-trips through the detokenizer, so it also stalls when
+                    the detokenizer is merely behind, and measured on prod
+                    kimi-k3 the overwhelming majority of those clear by
+                    themselves: 58 of 69 stalls on one worker lasted 13-19 s
+                    (a single missed probe) while /get_load never missed a beat.
+                    Only a stall that PERSISTS means the backend is unusable —
+                    which is why sglang's own detokenizer watchdog waits 20 s
+                    before it complains.
+        - 'ok'      answered 200.
+
+        Also refreshes the down-set `_pick` routes around; a timing-out serve is
+        left routable, since the caller decides when a stall has gone on long
+        enough to matter."""
         down: set[str] = set()
+        worst = "ok"
         async with httpx.AsyncClient(
                 timeout=httpx.Timeout(timeout, connect=4.0)) as c:
             for u in self.urls:
                 try:
-                    dead = (await c.get(self._root(u) + "/health")
-                            ).status_code != 200
+                    state = ("ok" if (await c.get(self._root(u) + "/health")
+                                      ).status_code == 200 else "dead")
                 except httpx.TimeoutException:
-                    dead = False        # alive, saturated: not a failure
+                    state = "timeout"
                 except (httpx.NetworkError, httpx.RemoteProtocolError):
-                    dead = True         # port closed / reset: the process is gone
+                    state = "dead"
                 except Exception:
-                    dead = False        # unknown: fail open, never invent an outage
-                if dead:
+                    state = "timeout"      # unknown: treat as inconclusive
+                if state == "dead":
                     down.add(u)
+                if state != "ok" and worst == "ok":
+                    worst = state
+                elif state == "dead":
+                    worst = "dead"
         self._down = down
-        return len(down) < len(self.urls)
+        if len(down) < len(self.urls) and worst == "dead":
+            worst = "ok"                   # another serve can still take work
+        return worst
 
     def _release(self, u: str):
         self._n[u] = max(0, self._n.get(u, 0) - 1)
@@ -982,6 +994,12 @@ META_RECHECK_S = 5.0
 # consecutive good probes are required before reconnecting, to ride out a
 # flapping/relaunching backend.
 _HEALTH_OK_STREAK = 2
+# Consecutive TIMED-OUT probes before withdrawing. 1 is too trigger-happy: on
+# prod kimi-k3, 58 of 69 /health stalls were a single missed probe (13-19 s)
+# that cleared itself, while the real faults — a hung detokenizer — ran 34 s and
+# 72 s. At the 8 s timeout + 5 s interval cadence, 2 means ~26 s, just past
+# sglang's own 20 s detokenizer watchdog.
+_HEALTH_FAIL_STREAK = 2
 
 
 async def _supervise(cfg, capacity: dict, load: Load):
@@ -1010,21 +1028,30 @@ async def _supervise(cfg, capacity: dict, load: Load):
         await asyncio.sleep(1.0)
     backend_down = False
     ok_streak = 0
+    fail_streak = 0
     try:
         while True:
-            ok = await backend.healthy()
-            if ok:
+            state = await backend.probe()
+            if state == "ok":
                 ok_streak += 1
+                fail_streak = 0
                 if backend_down and ok_streak >= _HEALTH_OK_STREAK:
                     backend_down = False
                     print("[tee_miner] backend RECOVERED — reconnecting legs",
                           flush=True)
             else:
                 ok_streak = 0
-                if not backend_down:
+                fail_streak += 1
+                # 'dead' is unambiguous, so act on the first one. A timeout is
+                # not, so require it to persist: one missed probe is the normal
+                # noise of a busy front-end, and dropping every leg over it
+                # withdraws a healthy worker exactly when the fleet is busiest.
+                trip = state == "dead" or fail_streak >= _HEALTH_FAIL_STREAK
+                if trip and not backend_down:
                     backend_down = True
-                    print("[tee_miner] backend UNHEALTHY (OOM/unreachable) — "
-                          "disconnecting all legs", flush=True)
+                    print("[tee_miner] backend UNHEALTHY (%s x%d) — "
+                          "disconnecting all legs" % (state, fail_streak),
+                          flush=True)
             if backend_down:
                 if legs:
                     for t in legs.values():
