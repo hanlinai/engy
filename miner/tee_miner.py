@@ -158,6 +158,18 @@ def _env(key, default=None):
     return v if v not in (None, "") else default
 
 
+# How long a drained leg keeps playing out work it already accepted before it is
+# cut. This is a deploy-shedding bound, so it must never be shorter than the
+# longest request the gateway will still wait for. Cutting early severs a
+# request that has not timed out and books it as a 504 against a worker that was
+# answering correctly. Size it from the longest generation this deployment
+# actually serves rather than a round number; the default tracks the upstream
+# read timeout, since a request the backend may still be working on is exactly
+# the one a drained leg must not drop.
+DRAIN_GRACE_S = float(_env("ENGY_DRAIN_GRACE_S",
+                           _env("ENGY_READ_TIMEOUT", "1800")))
+
+
 # -------------------------------------------------------------------- identity
 def _resolve_miner_key(explicit: str | None) -> str:
     """The operator key this worker registers under. On a TEE box it is injected
@@ -302,6 +314,40 @@ class Load:
 
     def idle_seconds(self) -> float:
         return 0.0 if self.inflight else time.time() - self.last_idle
+
+    async def broadcast(self) -> None:
+        """Push the true count to EVERY leg the moment it changes.
+
+        The periodic heartbeat is far too coarse to admit against. A reported
+        count is authoritative only while it is fresh; once it goes stale the
+        gateway falls back to its own partial per-leg view. On a 30s timer that
+        fallback is the common case, so admission ends up running against the
+        very view this counter exists to replace.
+
+        Reporting only to the leg that handled the request is not enough
+        either. Each leg lands on a different gateway worker, and a request
+        finishing on one frees capacity that a caller queued on another should
+        get — a completion that other worker can never observe directly. Queued
+        callers are released when a report DROPS, so without a broadcast a
+        freed slot wakes nobody and the caller waits out its own timeout
+        against capacity that is already idle.
+
+        `capacity` and `kv` are both omitted. The gateway merges capacity
+        across heartbeats and only re-reads KV when the frame actually carries
+        it, so leaving them out preserves the last good values rather than
+        clobbering them — and `kv_load()` costs two GETs per serve, which has no
+        business on the request path. KV keeps riding the periodic frame.
+
+        Best-effort per leg. This runs on the request path and must never fail
+        the request it describes, so a dead leg is dropped, never raised.
+        """
+        for ws in list(self._channels):
+            try:
+                await ws.send(json.dumps(P.heartbeat(
+                    inflight=self.inflight,
+                    idle_seconds=self.idle_seconds())))
+            except Exception:
+                self._channels.discard(ws)
 
 
 # ------------------------------------------------------------------ the lanes
@@ -792,6 +838,10 @@ async def _serve_one(ws, frame, backend: Serve, load: Load):
     rid = request.get("engy_request_id") or uuid.uuid4().hex
     load.start()
     try:
+        # Report the acquire from INSIDE the try: `load.start()` has already
+        # incremented, so anything raised here must still reach `finally` or the
+        # slot leaks.
+        await load.broadcast()
         if is_text_completion(request):
             # Both raw-completion lanes answer in one shot. Streaming a span
             # score is meaningless: max_tokens is 0 and the payload is the
@@ -821,7 +871,11 @@ async def _serve_one(ws, frame, backend: Serve, load: Load):
             pass
         print(f"[tee_miner] serve error: {e!r}", flush=True)
     finally:
+        # MUST be in `finally`: a slot leaked on the error path would shrink the
+        # advertised capacity permanently, and the count only ever drifts one
+        # way, so the miner would slowly strangle itself.
         load.done()
+        await load.broadcast()
 
 
 async def _heartbeat(ws, interval: float, load: Load, cap: dict, backend=None):
@@ -837,12 +891,17 @@ async def _heartbeat(ws, interval: float, load: Load, cap: dict, backend=None):
 
 
 async def _retire(ws, hb, serving: dict, load: Load, tag: str,
-                  grace: float = 900.0):
+                  grace: float = DRAIN_GRACE_S):
     """A drained leg keeps serving what it already accepted, then closes.
 
     It stays attached on purpose: the gateway worker behind it must keep
     receiving load reports until the last request lands. Closing at the drain
     instant is what 504s every in-flight request.
+
+    `grace` bounds that wait, and is sized from the longest generation this
+    deployment serves rather than picked as a round number — see
+    DRAIN_GRACE_S. Anything below it hands the same 504 back on a slower path:
+    the request is cut while the gateway is still waiting for it.
     """
     deadline = time.time() + grace
     try:
