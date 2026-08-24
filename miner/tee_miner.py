@@ -158,6 +158,18 @@ def _env(key, default=None):
     return v if v not in (None, "") else default
 
 
+# How long a drained leg keeps playing out work it already accepted before it is
+# cut. This is a deploy-shedding bound, so it must never be shorter than the
+# longest request the gateway will still wait for. Cutting early severs a
+# request that has not timed out and books it as a 504 against a worker that was
+# answering correctly. Size it from the longest generation this deployment
+# actually serves rather than a round number; the default tracks the upstream
+# read timeout, since a request the backend may still be working on is exactly
+# the one a drained leg must not drop.
+DRAIN_GRACE_S = float(_env("ENGY_DRAIN_GRACE_S",
+                           _env("ENGY_READ_TIMEOUT", "1800")))
+
+
 # -------------------------------------------------------------------- identity
 def _resolve_miner_key(explicit: str | None) -> str:
     """The operator key this worker registers under. On a TEE box it is injected
@@ -879,12 +891,17 @@ async def _heartbeat(ws, interval: float, load: Load, cap: dict, backend=None):
 
 
 async def _retire(ws, hb, serving: dict, load: Load, tag: str,
-                  grace: float = 900.0):
+                  grace: float = DRAIN_GRACE_S):
     """A drained leg keeps serving what it already accepted, then closes.
 
     It stays attached on purpose: the gateway worker behind it must keep
     receiving load reports until the last request lands. Closing at the drain
     instant is what 504s every in-flight request.
+
+    `grace` bounds that wait, and is sized from the longest generation this
+    deployment serves rather than picked as a round number — see
+    DRAIN_GRACE_S. Anything below it hands the same 504 back on a slower path:
+    the request is cut while the gateway is still waiting for it.
     """
     deadline = time.time() + grace
     try:

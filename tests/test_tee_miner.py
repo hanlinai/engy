@@ -1,8 +1,10 @@
-"""tee_miner in-flight reporting.
+"""tee_miner load reporting and drain grace.
 
-Invisible in a single-process test of the miner alone — it only matters through
-the gateway's admission path — so these pin the property that path reads: an
-in-flight transition reaches EVERY leg immediately, at both ends.
+Both behaviours are invisible in a single-process test of the miner alone —
+they only matter through the gateway's admission path — so these pin the two
+properties that path reads: that an in-flight transition reaches EVERY leg
+immediately, and that a drained leg outlives any request its backend may still
+be working on.
 """
 import asyncio
 import json
@@ -108,3 +110,17 @@ def test_serve_one_still_reports_the_release_when_the_backend_fails():
     asyncio.run(tm._serve_one(ws, CHAT, Broken(), load))
 
     assert [h["inflight"] for h in ws.heartbeats()] == [1, 0]
+
+
+def test_drain_grace_outlives_the_upstream_read_timeout():
+    """The two knobs have to move together. A leg cut while its backend is
+    still allowed to be generating books a 504 against a worker that was
+    answering correctly — the same failure the retire path exists to prevent,
+    just on a slower path."""
+    assert tm.DRAIN_GRACE_S >= float(tm._env("ENGY_READ_TIMEOUT", "1800"))
+
+
+def test_retire_defaults_to_the_configured_grace():
+    import inspect
+    default = inspect.signature(tm._retire).parameters["grace"].default
+    assert default == tm.DRAIN_GRACE_S
