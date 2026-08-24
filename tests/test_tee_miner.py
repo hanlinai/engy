@@ -124,3 +124,42 @@ def test_retire_defaults_to_the_configured_grace():
     import inspect
     default = inspect.signature(tm._retire).parameters["grace"].default
     assert default == tm.DRAIN_GRACE_S
+
+
+class ClosedWS:
+    """A socket after the fact: only the close code and reason survive."""
+
+    def __init__(self, code=None, reason=""):
+        self.close_code = code
+        self.close_reason = reason
+
+
+def test_close_note_names_the_dropped_transport_apart_from_a_clean_close():
+    # The whole point: 1006 (transport died, no close frame) and 1000 (peer
+    # said goodbye) both surface as websockets.ConnectionClosed, which _session
+    # swallows. If the log cannot tell them apart, a leg that took requests
+    # down with it is indistinguishable from a normal rotation.
+    clean = tm._close_note(ClosedWS(1000))
+    dropped = tm._close_note(ClosedWS(1006))
+    assert "1000" in clean and "normal" in clean
+    assert "1006" in dropped and "transport died" in dropped
+    assert clean != dropped
+
+
+def test_close_note_carries_the_servers_reason_when_there_is_one():
+    note = tm._close_note(ClosedWS(1011, "keepalive ping timeout"))
+    assert "1011" in note
+    assert "keepalive ping timeout" in note
+
+
+def test_close_note_never_raises_on_a_socket_that_never_opened():
+    # _leg's error path logs this for `ws is None` (connect itself failed) and
+    # for a socket closed without a code; a logging helper must not be the
+    # thing that kills the reconnect loop.
+    assert tm._close_note(None) == "never connected"
+    assert "unknown" in tm._close_note(ClosedWS(None))
+
+
+def test_close_note_still_reports_a_code_it_has_no_name_for():
+    note = tm._close_note(ClosedWS(4321))
+    assert "4321" in note and "unspecified" in note

@@ -973,9 +973,48 @@ async def _session(ws, cfg, cap, load: Load, tag: str) -> bool:
         else:
             hb.cancel()
             load.detach(ws)
+            lost = len(serving)
             for task in list(serving.values()):
                 task.cancel()
+            if lost:
+                # The gateway is still waiting on every one of these; each
+                # becomes a 504 the instant this socket goes. This is the only
+                # place that number exists — the gateway logs the 504 but not
+                # that a whole leg took the request down with it.
+                print(f"[tee_miner] {tag} dropping {lost} in-flight request(s)",
+                      flush=True)
     return drained
+
+
+# WebSocket close codes worth naming in a log line. 1006 is the one that matters
+# most here: it is synthesised locally when the transport died WITHOUT a close
+# frame — the peer never got to say goodbye. A gateway that keeps writing SERVE
+# frames into such a socket sees the writes succeed (they land in the kernel
+# buffer) and only discovers the leg is gone when its own keepalive gives up,
+# 20-40 s later. Every request dispatched in that window 504s having never
+# reached the serve.
+_CLOSE_NAMES = {
+    1000: "normal", 1001: "going away", 1002: "protocol error",
+    1003: "unsupported data", 1005: "no status",
+    1006: "abnormal - transport died, no close frame",
+    1007: "invalid payload", 1008: "policy violation",
+    1009: "message too big", 1010: "extension negotiation failed",
+    1011: "server error or keepalive timeout", 1012: "service restart",
+    1013: "try again later", 1015: "TLS failure",
+}
+
+
+def _close_note(ws) -> str:
+    """Human-readable close code + reason, for a log line that can be triaged
+    without a packet capture."""
+    if ws is None:
+        return "never connected"
+    code = getattr(ws, "close_code", None)
+    if code is None:
+        return "close code unknown"
+    reason = (getattr(ws, "close_reason", "") or "").strip()
+    note = f"close {code} ({_CLOSE_NAMES.get(code, 'unspecified')})"
+    return f"{note} {reason!r}" if reason else note
 
 
 async def _leg(i: int, n: int, cfg, cap, load: Load):
@@ -1000,14 +1039,21 @@ async def _leg(i: int, n: int, cfg, cap, load: Load):
                 print(f"[tee_miner] {tag} draining; re-dialing now", flush=True)
                 continue
             await ws.close()
-            print(f"[tee_miner] {tag} session ended; reconnecting", flush=True)
+            # `except websockets.ConnectionClosed: pass` in _session swallows a
+            # clean 1000, an abnormal 1006 and a server-side 1011 alike, so a
+            # bare "session ended" cannot tell a normal rotation from a dropped
+            # connection. That gap is why a 504 had to be diagnosed from a
+            # duration histogram instead of from the reason. Print the code.
+            print(f"[tee_miner] {tag} session ended; {_close_note(ws)}; "
+                  f"reconnecting", flush=True)
         except Exception as e:
             if ws is not None:
                 try:
                     await ws.close()
                 except Exception:
                     pass
-            print(f"[tee_miner] {tag} disconnected: {e!r}", flush=True)
+            print(f"[tee_miner] {tag} disconnected: {e!r}; {_close_note(ws)}",
+                  flush=True)
         await asyncio.sleep(0.5)
 
 
