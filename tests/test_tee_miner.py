@@ -243,3 +243,101 @@ def test_dialect_does_not_disturb_the_rest_of_the_body():
     assert body["tools"] == [1]
     assert body["stream"] is True
     assert body["stream_options"] == {"include_usage": True}
+class FakeInfoClient:
+    """Stands in for the httpx client `_max_total` probes /get_server_info with.
+
+    `script` is consumed one entry per call: an Exception is raised (the serve
+    is not listening yet), a dict is returned as the JSON body.
+    """
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = 0
+
+    async def get(self, url):
+        self.calls += 1
+        item = self.script.pop(0) if self.script else self.script_last
+        self.script_last = item
+        if isinstance(item, Exception):
+            raise item
+        return FakeInfoResponse(item)
+
+
+class FakeInfoResponse:
+    def __init__(self, body):
+        self._body = body
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._body
+
+
+OK_INFO = {"max_total_num_tokens": 1436312, "dcp_size": 1}
+
+
+def _kv_serve():
+    return tm.Serve(["http://127.0.0.1:30001/v1"], "/model", 60.0)
+
+
+def test_pool_size_is_cached_after_one_successful_probe():
+    """The pool is fixed for the life of a serve, so a success must not be
+    re-fetched on every heartbeat."""
+    s = _kv_serve()
+    c = FakeInfoClient([OK_INFO])
+    got = [asyncio.run(s._max_total(c, "http://127.0.0.1:30001")) for _ in range(5)]
+    assert got == [1436312] * 5
+    assert c.calls == 1
+
+
+def test_a_failed_probe_is_retried_rather_than_cached_forever():
+    """The regression this fixes: the miner is started alongside its serve, so
+    the first probe lands while sglang is still loading weights. Caching that
+    failure left the worker reporting kv `used`/`reqs` with no `limit` for the
+    whole life of the process."""
+    s = _kv_serve()
+    c = FakeInfoClient([ConnectionRefusedError("still loading"), OK_INFO])
+    assert asyncio.run(s._max_total(c, "http://127.0.0.1:30001")) is None
+    s._mtt_retry.clear()                      # stand in for the backoff elapsing
+    assert asyncio.run(s._max_total(c, "http://127.0.0.1:30001")) == 1436312
+    assert c.calls == 2
+
+
+def test_a_failure_backs_off_instead_of_probing_every_heartbeat():
+    """A serve that genuinely has no /get_server_info (older sglang, vLLM) must
+    not be re-probed several times a second."""
+    s = _kv_serve()
+    c = FakeInfoClient([ConnectionRefusedError("no such endpoint")])
+    for _ in range(10):
+        assert asyncio.run(s._max_total(c, "http://127.0.0.1:30001")) is None
+    assert c.calls == 1
+
+
+def test_an_answer_with_no_usable_pool_size_also_backs_off():
+    """A 200 carrying max_total_num_tokens=0 is not a pool size; treat it like a
+    failure rather than caching 0 and reporting frac=inf."""
+    s = _kv_serve()
+    c = FakeInfoClient([{"max_total_num_tokens": 0, "dcp_size": 1}])
+    assert asyncio.run(s._max_total(c, "http://127.0.0.1:30001")) is None
+    assert s._mtt.get("http://127.0.0.1:30001") is None
+    assert "http://127.0.0.1:30001" in s._mtt_retry
+
+
+def test_dcp_size_multiplies_the_per_rank_pool():
+    """sglang reports max_total_num_tokens PER DCP RANK while /get_load's
+    num_tokens is global."""
+    s = _kv_serve()
+    c = FakeInfoClient([{"max_total_num_tokens": 100, "dcp_size": 8}])
+    assert asyncio.run(s._max_total(c, "http://127.0.0.1:30001")) == 800
+
+
+def test_each_serve_is_probed_and_backed_off_independently():
+    """A host runs two serves; one being slow must not blind the other."""
+    s = tm.Serve(["http://127.0.0.1:30001/v1", "http://127.0.0.1:30002/v1"],
+                 "/model", 60.0)
+    c = FakeInfoClient([OK_INFO, ConnectionRefusedError("not up")])
+    assert asyncio.run(s._max_total(c, "http://127.0.0.1:30001")) == 1436312
+    assert asyncio.run(s._max_total(c, "http://127.0.0.1:30002")) is None
+    assert "http://127.0.0.1:30001" not in s._mtt_retry
+    assert "http://127.0.0.1:30002" in s._mtt_retry
