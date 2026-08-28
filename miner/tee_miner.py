@@ -501,6 +501,12 @@ def _text_completion(model, text, usage, finish_reason="stop",
 
 
 # --------------------------------------------------------------------- backend
+# How long to wait before re-probing a serve whose /get_server_info did not
+# yield a KV pool size. Long enough that a serve which will never answer costs
+# ~one GET a minute, short enough that a serve still loading weights starts
+# reporting KV pressure within a minute of coming up.
+_MTT_RETRY_S = 60.0
+
 class Serve:
     """The local OpenAI-compatible serve, least-in-flight balanced across urls.
 
@@ -517,6 +523,7 @@ class Serve:
         self._n = {u: 0 for u in urls}
         self._down: set[str] = set()
         self._mtt: dict = {}   # per-serve KV pool size, cached (fixed per serve)
+        self._mtt_retry: dict = {}   # per-serve: earliest monotonic retry
 
     def _pick(self) -> str:
         pool = [u for u in self.urls if u not in self._down] or self.urls
@@ -581,18 +588,41 @@ class Serve:
         """KV pool size of the serve at `root` in TOKENS, cached (fixed per serve).
         sglang reports `max_total_num_tokens` PER DCP RANK, while /get_load's
         num_tokens is GLOBAL, so the true pool is max_total_num_tokens * dcp_size
-        (dcp_size defaults to 1 → no change for non-DCP serves)."""
-        if root not in self._mtt:
-            try:
-                r = await c.get(root + "/get_server_info")
-                r.raise_for_status()
-                info = r.json()
-                mtt = int(info.get("max_total_num_tokens") or 0)
-                dcp = int(info.get("dcp_size") or 1) or 1
-                self._mtt[root] = (mtt * dcp) or None
-            except Exception:
-                self._mtt[root] = None
-        return self._mtt[root]
+        (dcp_size defaults to 1 → no change for non-DCP serves).
+
+        Only a SUCCESS is cached. A failure is retried after _MTT_RETRY_S,
+        because the overwhelmingly common failure is a startup race, not a serve
+        that will never answer: the deploy scripts launch the miner alongside
+        the serve, so the first probes land while sglang is still loading
+        weights and the connection is simply refused. Caching that permanently
+        (which is what `if root not in self._mtt: ... except: self._mtt[root] =
+        None` did) left the worker reporting `used`/`reqs` with no `limit` for
+        the entire life of the process, so the gateway's KV admission gate could
+        never judge it and silently fell back to in-flight count alone. Seen in
+        prod on m5-31's two qwen3.8 miners.
+
+        The backoff matters as much as the retry: a serve that genuinely has no
+        `/get_server_info` (older sglang, vLLM) must not be re-probed on every
+        heartbeat, which is every few seconds."""
+        if root in self._mtt:
+            return self._mtt[root]
+        if time.monotonic() < self._mtt_retry.get(root, 0.0):
+            return None
+        try:
+            r = await c.get(root + "/get_server_info")
+            r.raise_for_status()
+            info = r.json()
+            mtt = int(info.get("max_total_num_tokens") or 0)
+            dcp = int(info.get("dcp_size") or 1) or 1
+            if mtt > 0:
+                self._mtt[root] = mtt * dcp
+                return self._mtt[root]
+        except Exception:
+            pass
+        # Answered with nothing usable, or did not answer at all: same handling,
+        # since both are indistinguishable from "not ready yet" at this point.
+        self._mtt_retry[root] = time.monotonic() + _MTT_RETRY_S
+        return None
 
     async def kv_load(self):
         """Live KV-cache pressure across the local serve(s): tokens occupied vs
