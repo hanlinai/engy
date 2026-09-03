@@ -163,3 +163,48 @@ def test_close_note_never_raises_on_a_socket_that_never_opened():
 def test_close_note_still_reports_a_code_it_has_no_name_for():
     note = tm._close_note(ClosedWS(4321))
     assert "4321" in note and "unspecified" in note
+
+
+# ---- usage: the thinking-token count the gateway translates for buyers ----
+
+# verbatim from a prod qwen3.8-27b serve (m5-27:30001), reasoning_effort=medium
+SGLANG_USAGE = {"prompt_tokens": 22, "total_tokens": 89, "completion_tokens": 67,
+                "prompt_tokens_details": None, "reasoning_tokens": 53}
+
+
+def test_clean_usage_keeps_the_flat_count_sglang_actually_sends():
+    """Dropping it here is what made thinking invisible to buyers: the count
+    exists upstream, and the miner's allowlist threw it away before the
+    gateway could translate it."""
+    assert tm._clean_usage(SGLANG_USAGE)["reasoning_tokens"] == 53
+
+
+def test_clean_usage_also_accepts_the_openai_nested_spelling():
+    u = tm._clean_usage({"prompt_tokens": 1, "completion_tokens": 9,
+                         "completion_tokens_details": {"reasoning_tokens": 4}})
+    assert u["reasoning_tokens"] == 4
+
+
+def test_clean_usage_omits_it_when_the_serve_never_counted_it():
+    """A serve with no reasoning parser. "Unknown" must not become a zero."""
+    assert "reasoning_tokens" not in tm._clean_usage({"prompt_tokens": 5,
+                                                      "completion_tokens": 7})
+
+
+def test_clean_usage_keeps_a_genuine_zero():
+    u = tm._clean_usage({"prompt_tokens": 5, "completion_tokens": 7,
+                         "reasoning_tokens": 0})
+    assert u["reasoning_tokens"] == 0
+
+
+def test_clean_usage_still_drops_upstream_extras():
+    """The allowlist exists so provider cost/byok fields never reach billing."""
+    u = tm._clean_usage({**SGLANG_USAGE, "cost": 0.12, "provider": "openrouter"})
+    assert set(u) == {"prompt_tokens", "completion_tokens", "total_tokens",
+                      "reasoning_tokens"}
+
+
+def test_clean_usage_leaves_the_billed_numbers_alone():
+    """Thinking tokens are a subset of completion_tokens — already billed."""
+    u = tm._clean_usage(SGLANG_USAGE)
+    assert (u["prompt_tokens"], u["completion_tokens"], u["total_tokens"]) == (22, 67, 89)

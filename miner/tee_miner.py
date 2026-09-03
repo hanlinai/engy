@@ -470,6 +470,23 @@ def _clean_usage(raw: dict) -> dict:
     if isinstance(details, dict) and details.get("cached_tokens") is not None:
         u["prompt_tokens_details"] = {
             "cached_tokens": int(details["cached_tokens"])}
+    # Thinking tokens, a SUBSET of completion_tokens. sglang reports this FLAT
+    # on `usage.reasoning_tokens` (its own UsageInfo field); the gateway edge
+    # translates it into OpenAI's nested `completion_tokens_details` before a
+    # buyer sees it, so the upstream dialect is kept here and converted once,
+    # in one place. Dropping it here is what made the count invisible: a live
+    # qwen3.8-27b answers 53 of 67 completion tokens on reasoning_effort=medium
+    # and none of it reached the buyer.
+    #
+    # Absent stays absent -- a serve with no reasoning parser reports nothing,
+    # and "we do not know" must not be forwarded as a zero.
+    reasoning = raw.get("reasoning_tokens")
+    if reasoning is None:
+        nested = raw.get("completion_tokens_details")
+        if isinstance(nested, dict):
+            reasoning = nested.get("reasoning_tokens")
+    if reasoning is not None:
+        u["reasoning_tokens"] = int(reasoning)
     return u
 
 
