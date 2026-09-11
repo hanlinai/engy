@@ -514,10 +514,13 @@ def _gen_once(serve, input_ids, max_new, emit=None, skip_first_token=False, job=
 def _generate_chunked(serve, prompt_ids, max_new, emit=None, job=None):
     """Generate up to max_new tokens in GEN_CHUNK-sized serve calls, collecting the
     per-token final hidden states in order. Returns (all_oids, rows_list,
-    prompt_extra, cached): all_oids = proven output tokens; rows_list = one np
-    hidden row per proven token; prompt_extra = tokens folded into the prompt on
-    chunk 1 (only when the prompt was already radix-cached, rare); cached = how
-    much of the BUYER's prompt came from the radix cache.
+    prompt_extra, cached, truncated): all_oids = proven output tokens; rows_list =
+    one np hidden row per proven token; prompt_extra = tokens folded into the prompt
+    on chunk 1 (only when the prompt was already radix-cached, rare); cached = how
+    much of the BUYER's prompt came from the radix cache; truncated = the budget ran
+    out with the model still generating, which is what `finish_reason: "length"`
+    means. The per-chunk `ftype` cannot answer that on its own: EVERY full chunk
+    reports "length" because OUR chunk size ended it, not the buyer's max_tokens.
 
     cached is read from chunk 1 only. Every continuation re-sends the prompt plus
     the tokens so far and so is cached almost end to end; summing those would
@@ -531,6 +534,7 @@ def _generate_chunked(serve, prompt_ids, max_new, emit=None, job=None):
     rows_list: list = []
     prompt_extra: list = []
     cached = 0
+    stopped = False                  # the MODEL ended the generation, not the budget
     while len(all_oids) < max_new:
         if job is not None:
             job.check()              # never START a chunk for a departed buyer
@@ -558,8 +562,9 @@ def _generate_chunked(serve, prompt_ids, max_new, emit=None, job=None):
             all_oids.extend(kept)
             produced = len(kept)
         if ftype != "length" or produced < want:   # EOS / short -> generation ended
+            stopped = True
             break
-    return all_oids, rows_list, prompt_extra, cached
+    return all_oids, rows_list, prompt_extra, cached, not stopped
 
 
 def _build_commitment(prompt_full, all_oids, rows_list):
@@ -639,9 +644,21 @@ def _split_think(text, think_open):
     return text, ""
 
 
-def _assemble_message(text, tools, think_open):
-    """Raw decoded output -> (OpenAI assistant message, finish_reason). A pure-
-    reasoning turn falls back to the reasoning so content is never empty."""
+def _assemble_message(text, tools, think_open, truncated=False):
+    """Raw decoded output -> (OpenAI assistant message, finish_reason).
+
+    `truncated` = max_tokens ended the generation. It has to be reported as
+    `finish_reason: "length"`, and it is exactly the case this used to get wrong:
+    a budget that runs out INSIDE the think block leaves no closing `</think>`, so
+    every token is reasoning and there is no content at all. Answering "stop" there
+    tells a client the turn completed when the model was cut off mid-thought.
+
+    `content` stays empty on such a turn rather than falling back to the reasoning
+    text. Publishing raw chain of thought as if it were the answer is wrong in the
+    dangerous direction, and silent — the buyer cannot tell it apart from a real
+    answer. The thinking is still delivered, in `reasoning_content`, and
+    `finish_reason` now says why content is empty. (Both the refminer and tee_miner
+    already behave this way; this is the last lane that did not.)"""
     visible, reasoning = _split_think(text, think_open)
     calls = (_parse_tool_calls(visible, _tool_param_types(tools))
              if "<tool_call>" in visible else [])
@@ -653,9 +670,14 @@ def _assemble_message(text, tools, think_open):
         msg["tool_calls"] = calls
     if reasoning:
         msg["reasoning_content"] = reasoning
-    if msg["content"] is None and not calls:
-        msg["content"] = reasoning
-    return msg, ("tool_calls" if calls else "stop")
+    # "length" outranks "tool_calls": a call parsed out of a truncated generation is
+    # still a truncated generation (sglang's own OpenAI route promotes to
+    # "tool_calls" only from "stop", and this lane must not disagree with it).
+    if truncated:
+        finish = "length"
+    else:
+        finish = "tool_calls" if calls else "stop"
+    return msg, finish
 
 
 class _QwenStream:
@@ -786,7 +808,7 @@ def _process(request: dict, emit=None, job=None):
     if job is not None:
         job.serve = serve            # _on_cancel needs this to address the abort
     try:
-        all_oids, rows_list, prompt_extra, cached = _generate_chunked(
+        all_oids, rows_list, prompt_extra, cached, truncated = _generate_chunked(
             serve, prompt_ids, max_new, (stream.feed if stream else None), job)
     finally:
         _release_serve(serve)
@@ -796,7 +818,7 @@ def _process(request: dict, emit=None, job=None):
     prompt_full = prompt_ids + prompt_extra
     commitment = _build_commitment(prompt_full, all_oids, rows_list)
     text = _tokenizer.decode(all_oids, skip_special_tokens=True)
-    msg, finish = _assemble_message(text, tools, think_open)
+    msg, finish = _assemble_message(text, tools, think_open, truncated)
     n_prompt, n = len(prompt_full), len(rows_list)
     usage = {"prompt_tokens": n_prompt, "completion_tokens": n,
              "total_tokens": n_prompt + n}
