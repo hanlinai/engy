@@ -163,3 +163,24 @@ serving the model:
 
 So this model needs `--context-length 262144` (224K + 32K). The miner already
 matches the 1800 s deadline by default — you do not have to set a timeout.
+
+---
+
+## 5. What the miner returns
+
+Two fields of the OpenAI response are decided by the miner rather than by the
+serve, and both matter to a buyer running an agent loop:
+
+- **`finish_reason`** is `"length"` whenever `max_tokens` — not the model —
+  ended the generation. A client that trusts the field treats `"stop"` as a
+  completed turn, so reporting `"stop"` on a cut-off answer is worse than
+  cutting it off. It is `"tool_calls"` only when calls were parsed AND the model
+  stopped on its own; truncation outranks it, which is also what sglang's own
+  OpenAI route does.
+- **`content` may be empty** with the whole generation in `reasoning_content`.
+  This is normal, not a failure: a reasoning model with a small `max_tokens`
+  spends the entire budget inside `<think>` and never reaches an answer, and a
+  model that answers briefly can do the same on a full-size budget. The miner
+  does **not** fall back to publishing the chain of thought as `content` —
+  that hands the buyer raw thinking dressed as an answer, indistinguishable
+  from a real one. `finish_reason` says which case it was.
