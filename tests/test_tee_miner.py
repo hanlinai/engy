@@ -243,3 +243,198 @@ def test_dialect_does_not_disturb_the_rest_of_the_body():
     assert body["tools"] == [1]
     assert body["stream"] is True
     assert body["stream_options"] == {"include_usage": True}
+# ---- usage: the thinking-token count the gateway translates for buyers ----
+
+# verbatim from a prod qwen3.8-27b serve (m5-27:30001), reasoning_effort=medium
+SGLANG_USAGE = {"prompt_tokens": 22, "total_tokens": 89, "completion_tokens": 67,
+                "prompt_tokens_details": None, "reasoning_tokens": 53}
+
+
+def test_clean_usage_keeps_the_flat_count_sglang_actually_sends():
+    """Dropping it here is what made thinking invisible to buyers: the count
+    exists upstream, and the miner's allowlist threw it away before the
+    gateway could translate it."""
+    assert tm._clean_usage(SGLANG_USAGE)["reasoning_tokens"] == 53
+
+
+def test_clean_usage_also_accepts_the_openai_nested_spelling():
+    u = tm._clean_usage({"prompt_tokens": 1, "completion_tokens": 9,
+                         "completion_tokens_details": {"reasoning_tokens": 4}})
+    assert u["reasoning_tokens"] == 4
+
+
+def test_clean_usage_omits_it_when_the_serve_never_counted_it():
+    """A serve with no reasoning parser. "Unknown" must not become a zero."""
+    assert "reasoning_tokens" not in tm._clean_usage({"prompt_tokens": 5,
+                                                      "completion_tokens": 7})
+
+
+def test_clean_usage_keeps_a_genuine_zero():
+    u = tm._clean_usage({"prompt_tokens": 5, "completion_tokens": 7,
+                         "reasoning_tokens": 0})
+    assert u["reasoning_tokens"] == 0
+
+
+def test_clean_usage_still_drops_upstream_extras():
+    """The allowlist exists so provider cost/byok fields never reach billing."""
+    u = tm._clean_usage({**SGLANG_USAGE, "cost": 0.12, "provider": "openrouter"})
+    assert set(u) == {"prompt_tokens", "completion_tokens", "total_tokens",
+                      "reasoning_tokens"}
+
+
+def test_clean_usage_leaves_the_billed_numbers_alone():
+    """Thinking tokens are a subset of completion_tokens — already billed."""
+    u = tm._clean_usage(SGLANG_USAGE)
+    assert (u["prompt_tokens"], u["completion_tokens"], u["total_tokens"]) == (22, 67, 89)
+
+
+# --- the backend health gate ------------------------------------------------
+#
+# The gate decides whether a /health stall means the serve is unusable. Getting
+# that wrong is expensive in one direction only: withdrawing cancels every leg
+# and the gateway books each in-flight request as a 504, so a stall must be
+# CONFIRMED against the scheduler (/get_load) before it costs anyone a request.
+
+
+class FakeServe:
+    """Just the two calls the gate makes on a backend."""
+
+    def __init__(self, scheduler=True):
+        self.scheduler = scheduler
+        self.load_probes = 0
+
+    async def scheduler_alive(self, timeout: float = 3.0) -> bool:
+        self.load_probes += 1
+        return self.scheduler
+
+
+class Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+    def tick(self, dt):
+        self.t += dt
+        return self.t
+
+
+def drive(gate, states, clock=None, dt=13.0):
+    """Feed probe outcomes at the real ~13 s cadence (8 s timeout + 5 s sleep)."""
+    out = []
+    for s in states:
+        out.append(asyncio.run(gate.update(s)))
+        if clock:
+            clock.tick(dt)
+    return out
+
+
+def test_health_stall_does_not_withdraw_while_the_scheduler_answers():
+    """The Ornith canary bug: two /health timeouts used to cancel every leg.
+    /get_load answering means the process is scheduling — a busy backend, not a
+    dead one — so the legs must stay up and the in-flight work must survive."""
+    serve = FakeServe(scheduler=True)
+    clock = Clock()
+    gate = tm._HealthGate(serve, clock=clock)
+    assert drive(gate, ["timeout"] * 6, clock) == [False] * 6
+    assert gate.down is False
+
+
+def test_a_single_missed_probe_never_even_asks_the_scheduler():
+    """/get_load is consulted on the timeout path only, and only once the
+    streak is long enough to matter — one missed probe stays free."""
+    serve = FakeServe(scheduler=True)
+    gate = tm._HealthGate(serve, clock=Clock())
+    drive(gate, ["timeout", "ok", "ok", "timeout", "ok"])
+    assert serve.load_probes == 0
+
+
+def test_a_stall_the_scheduler_cannot_confirm_still_withdraws():
+    """Both channels silent is the unambiguous case the gate exists for."""
+    serve = FakeServe(scheduler=False)
+    clock = Clock()
+    gate = tm._HealthGate(serve, clock=clock)
+    assert drive(gate, ["timeout", "timeout"], clock) == [False, True]
+    assert serve.load_probes == 1      # asked once, at the streak, not before
+
+
+def test_dead_withdraws_on_the_first_probe_without_asking():
+    """Connection refused / non-200 needs no second opinion."""
+    serve = FakeServe(scheduler=True)
+    gate = tm._HealthGate(serve, clock=Clock())
+    assert drive(gate, ["dead"]) == [True]
+    assert serve.load_probes == 0
+
+
+def test_a_stall_that_outlasts_the_backstop_withdraws_anyway():
+    """A wedged serve (the O(N^2) detokenizer hang) keeps answering /get_load
+    while serving nobody, so a stall that simply never ends must still trip."""
+    serve = FakeServe(scheduler=True)
+    clock = Clock()
+    gate = tm._HealthGate(serve, clock=clock)
+    down = drive(gate, ["timeout"] * 12, clock)
+    assert down[0] is False and True in down
+    tripped_at = down.index(True) * 13.0
+    assert tripped_at >= tm._HEALTH_STALL_MAX_S
+    assert tripped_at < tm._HEALTH_STALL_MAX_S + 13.0   # and not much later
+
+
+def test_the_stall_clock_restarts_after_a_good_probe():
+    """Two separate stalls either side of a healthy probe are not one long one,
+    so they must not add up into a withdrawal."""
+    serve = FakeServe(scheduler=True)
+    clock = Clock()
+    gate = tm._HealthGate(serve, clock=clock)
+    drive(gate, ["timeout"] * 8, clock)
+    drive(gate, ["ok"], clock)
+    assert drive(gate, ["timeout"] * 8, clock) == [False] * 8
+
+
+def test_recovery_still_needs_a_streak_of_good_probes():
+    serve = FakeServe(scheduler=False)
+    gate = tm._HealthGate(serve, clock=Clock())
+    drive(gate, ["timeout", "timeout"])
+    assert gate.down is True
+    assert drive(gate, ["ok"]) == [True]                # one is not enough
+    assert drive(gate, ["ok"]) == [False]
+
+
+def test_a_withdrawn_gate_stops_re_probing_the_scheduler():
+    """Once the legs are down there is nothing left to protect, so the extra
+    GET stops until /health comes back."""
+    serve = FakeServe(scheduler=False)
+    gate = tm._HealthGate(serve, clock=Clock())
+    drive(gate, ["timeout"] * 6)
+    assert serve.load_probes == 1
+
+
+def test_the_log_tells_a_ridden_out_stall_apart_from_a_withdrawal(capsys):
+    """Whoever reads miner.log next has to be able to see which happened."""
+    clock = Clock()
+    gate = tm._HealthGate(FakeServe(scheduler=True), clock=clock)
+    drive(gate, ["timeout", "timeout"], clock)
+    kept = capsys.readouterr().out
+    assert "staying up" in kept and "UNHEALTHY" not in kept
+
+    gate = tm._HealthGate(FakeServe(scheduler=False), clock=Clock())
+    drive(gate, ["timeout", "timeout"])
+    gone = capsys.readouterr().out
+    assert "UNHEALTHY" in gone and "/get_load silent" in gone
+
+
+def test_the_ridden_out_stall_is_logged_at_most_once_a_note_interval(capsys):
+    """A long stall must stay visible in the log without flooding it."""
+    clock = Clock()
+    gate = tm._HealthGate(FakeServe(scheduler=True), clock=clock)
+    drive(gate, ["timeout"] * 11, clock, dt=1.0)     # 11 s of stall, 1 s apart
+    notes = [ln for ln in capsys.readouterr().out.splitlines()
+             if "staying up" in ln]
+    assert len(notes) == 1
+
+    clock = Clock()
+    gate = tm._HealthGate(FakeServe(scheduler=True), clock=clock)
+    drive(gate, ["timeout"] * 8, clock, dt=tm._HEALTH_NOTE_S + 1)
+    notes = [ln for ln in capsys.readouterr().out.splitlines()
+             if "staying up" in ln]
+    assert 2 <= len(notes) <= 8      # paced, not silenced

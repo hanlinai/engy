@@ -518,6 +518,23 @@ def _clean_usage(raw: dict) -> dict:
     if isinstance(details, dict) and details.get("cached_tokens") is not None:
         u["prompt_tokens_details"] = {
             "cached_tokens": int(details["cached_tokens"])}
+    # Thinking tokens, a SUBSET of completion_tokens. sglang reports this FLAT
+    # on `usage.reasoning_tokens` (its own UsageInfo field); the gateway edge
+    # translates it into OpenAI's nested `completion_tokens_details` before a
+    # buyer sees it, so the upstream dialect is kept here and converted once,
+    # in one place. Dropping it here is what made the count invisible: a live
+    # qwen3.8-27b answers 53 of 67 completion tokens on reasoning_effort=medium
+    # and none of it reached the buyer.
+    #
+    # Absent stays absent -- a serve with no reasoning parser reports nothing,
+    # and "we do not know" must not be forwarded as a zero.
+    reasoning = raw.get("reasoning_tokens")
+    if reasoning is None:
+        nested = raw.get("completion_tokens_details")
+        if isinstance(nested, dict):
+            reasoning = nested.get("reasoning_tokens")
+    if reasoning is not None:
+        u["reasoning_tokens"] = int(reasoning)
     return u
 
 
@@ -623,6 +640,37 @@ class Serve:
         if len(down) < len(self.urls) and worst == "dead":
             worst = "ok"                   # another serve can still take work
         return worst
+
+    async def scheduler_alive(self, timeout: float = 3.0) -> bool:
+        """Is the SCHEDULER answering, even though /health did not?
+
+        /health round-trips through the detokenizer, so it stalls whenever the
+        detokenizer is merely behind — see `probe`. /get_load is served off the
+        scheduler's own state and does not, which is why it "never missed a
+        beat" through the kimi-k3 stalls: measured on an IDLE Ornith-1.5 serve
+        /get_load answered in 1.2 ms against /health's 1.0 s, ~800x apart.
+
+        True  -> at least one serve answered /get_load 200: the process is up
+                 and scheduling, so a /health stall is queueing, not a wedge.
+        False -> every serve failed to answer. That includes a serve too old to
+                 expose /get_load at all (404), which deliberately keeps the
+                 pre-existing withdraw-on-two-timeouts behaviour for it rather
+                 than inventing health it cannot see.
+
+        Never raises; only called on the timeout path, never on every probe."""
+        try:
+            async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(timeout, connect=2.0)) as c:
+                for u in self.urls:
+                    try:
+                        r = await c.get(self._root(u) + "/get_load")
+                        if r.status_code == 200 and isinstance(r.json(), list):
+                            return True
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return False
 
     def _release(self, u: str):
         self._n[u] = max(0, self._n.get(u, 0) - 1)
@@ -1171,16 +1219,112 @@ _HEALTH_OK_STREAK = 2
 # 72 s. At the 8 s timeout + 5 s interval cadence, 2 means ~26 s, just past
 # sglang's own 20 s detokenizer watchdog.
 _HEALTH_FAIL_STREAK = 2
+# ...and then only if the SCHEDULER has gone quiet too. A stall that /get_load
+# rides out still withdraws once it has lasted this long, so a genuinely wedged
+# serve — the known O(N^2) detokenizer hang keeps scheduling while it serves
+# nobody — is still caught. 120 s is ~4.6x the old trip point and past every
+# self-clearing stall on record (13-19 s typical, 72 s worst), so it is a
+# backstop, not the primary detector.
+_HEALTH_STALL_MAX_S = 120.0
+# While riding a stall out, say so at most this often.
+_HEALTH_NOTE_S = 30.0
+
+
+class _HealthGate:
+    """Should the miner be withdrawn right now? One probe outcome per tick.
+
+    The three probe outcomes are not symmetric:
+
+    - 'dead'    connection refused/reset or /health non-200. Unambiguous, and
+                back in milliseconds — withdraw on the first one.
+    - 'ok'      clears the gate; reconnect after _HEALTH_OK_STREAK of them.
+    - 'timeout' NOT proof of anything. sglang's /health round-trips through the
+                DETOKENIZER, so it stalls whenever the detokenizer is behind,
+                which a healthy worker does routinely. Withdrawing on two of
+                them cancels every leg, and the gateway books each in-flight
+                request as `504 miner timeout or disconnect`: all 5 of the 504s
+                the Ornith canary served across 1183 requests were this, with
+                no backend fault behind any of them (the largest prompt in any
+                failure window was 379 tokens, and a 1421-request load test
+                never tripped it once).
+
+    So on a timeout, ask the scheduler directly via /get_load before believing
+    /health. If it answers, the backend is alive and busy, not dead: stay up
+    and let the in-flight work finish. Only a stall where /get_load has gone
+    quiet TOO, or one that outlasts _HEALTH_STALL_MAX_S however lively
+    /get_load looks, is treated as a fault."""
+
+    def __init__(self, backend, *, clock=time.monotonic):
+        self._backend = backend
+        self._clock = clock
+        self.down = False
+        self.ok_streak = 0
+        self.fail_streak = 0
+        self._stall_since = None
+        self._last_note = 0.0
+
+    async def update(self, state: str) -> bool:
+        """Fold in one probe outcome; returns True while legs must stay down."""
+        if state == "ok":
+            self.ok_streak += 1
+            self.fail_streak = 0
+            self._stall_since = None
+            self._last_note = 0.0
+            if self.down and self.ok_streak >= _HEALTH_OK_STREAK:
+                self.down = False
+                print("[tee_miner] backend RECOVERED — reconnecting legs",
+                      flush=True)
+            return self.down
+        self.ok_streak = 0
+        self.fail_streak += 1
+        now = self._clock()
+        if self._stall_since is None:
+            self._stall_since = now
+        if self.down:
+            return True      # already withdrawn; recovery is ok_streak's job
+        why = await self._verdict(state, now - self._stall_since)
+        if why:
+            self.down = True
+            print("[tee_miner] backend UNHEALTHY (%s) — disconnecting all legs"
+                  % why, flush=True)
+        return self.down
+
+    async def _verdict(self, state: str, stalled: float):
+        """A reason to withdraw, or None to stay up. Consults /get_load ONLY
+        once /health has timed out _HEALTH_FAIL_STREAK times running."""
+        if state == "dead":
+            return "dead"
+        if self.fail_streak < _HEALTH_FAIL_STREAK:
+            return None
+        if not await self._backend.scheduler_alive():
+            return ("/health timeout x%d for %.0fs and /get_load silent too"
+                    % (self.fail_streak, stalled))
+        if stalled >= _HEALTH_STALL_MAX_S:
+            return ("/health timeout x%d — /get_load still answers, but %.0fs "
+                    "of stall is a wedge" % (self.fail_streak, stalled))
+        self._note(stalled)
+        return None
+
+    def _note(self, stalled: float):
+        now = self._clock()
+        if self._last_note and now - self._last_note < _HEALTH_NOTE_S:
+            return
+        self._last_note = now
+        print("[tee_miner] /health stalled %.0fs (timeout x%d) but /get_load "
+              "answers — scheduler alive, staying up"
+              % (stalled, self.fail_streak), flush=True)
 
 
 async def _supervise(cfg, capacity: dict, load: Load):
     """Leg supervisor, ported from the reference miner.
 
     Two jobs beyond keeping N legs dialed:
-    - Backend health gate: when the serve OOMs or wedges, DISCONNECT every leg
-      so the gateway stops routing buyers here (the alternative is advertising
-      a dead backend and 502ing everything). Reconnect only after
-      _HEALTH_OK_STREAK consecutive good probes.
+    - Backend health gate (_HealthGate): when the serve OOMs or wedges,
+      DISCONNECT every leg so the gateway stops routing buyers here (the
+      alternative is advertising a dead backend and 502ing everything). A
+      /health stall alone is not that — it is confirmed against /get_load
+      first, since cancelling legs 504s whatever they were serving. Reconnect
+      only after _HEALTH_OK_STREAK consecutive good probes.
     - Incremental leg management keyed by worker INDEX: a gateway scale event
       adds legs for new workers and drops legs for removed ones, but never
       touches an existing leg — cancelling a live leg 504s its streams.
@@ -1197,33 +1341,10 @@ async def _supervise(cfg, capacity: dict, load: Load):
         if fetched is not None:
             break
         await asyncio.sleep(1.0)
-    backend_down = False
-    ok_streak = 0
-    fail_streak = 0
+    gate = _HealthGate(backend)
     try:
         while True:
-            state = await backend.probe()
-            if state == "ok":
-                ok_streak += 1
-                fail_streak = 0
-                if backend_down and ok_streak >= _HEALTH_OK_STREAK:
-                    backend_down = False
-                    print("[tee_miner] backend RECOVERED — reconnecting legs",
-                          flush=True)
-            else:
-                ok_streak = 0
-                fail_streak += 1
-                # 'dead' is unambiguous, so act on the first one. A timeout is
-                # not, so require it to persist: one missed probe is the normal
-                # noise of a busy front-end, and dropping every leg over it
-                # withdraws a healthy worker exactly when the fleet is busiest.
-                trip = state == "dead" or fail_streak >= _HEALTH_FAIL_STREAK
-                if trip and not backend_down:
-                    backend_down = True
-                    print("[tee_miner] backend UNHEALTHY (%s x%d) — "
-                          "disconnecting all legs" % (state, fail_streak),
-                          flush=True)
-            if backend_down:
+            if await gate.update(await backend.probe()):
                 if legs:
                     for t in legs.values():
                         t.cancel()
