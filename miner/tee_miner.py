@@ -367,6 +367,54 @@ _PASSTHROUGH = ("temperature", "top_p", "n", "stop", "presence_penalty",
 _TEXT_PASSTHROUGH = ("echo", "suffix", "best_of")
 
 
+# ---- chat-template dialects ----
+# One image serves the whole fleet, but the templates behind it are NOT
+# interchangeable: a quirk worked around for one model is a regression on
+# another, so every entry is opt-in per model rather than unconditional.
+#
+# * `effort` -- Qwen3.8's template accepts only xhigh (its default AND maximum) /
+#   medium / low and `raise_exception`s a 400 on anything else, so OpenAI's
+#   "high" and GLM's "max" have to fold onto xhigh. The prod gateway normalizes
+#   every buyer effort into exactly that pair, so without this map a Qwen3.8
+#   worker 400s most reasoning traffic. DeepSeek-V4 must NOT get the mapping:
+#   its ladder is a preamble sglang injects (`encoding_dsv4`), and an effort the
+#   active profile does not list is silently DROPPED to the profile default --
+#   "xhigh" there does not 400, it quietly answers at the default instead.
+# * `system_first_only` -- Qwen3.8 hard-rejects a `system` message anywhere but
+#   position 0 ("System message must be at the beginning"), which 400s clients
+#   that inject mid-conversation system turns (Claude Code after an auto-compact).
+#   Demoting those to `user` rescues the request there, but on a template that
+#   accepts them it rewrites the prompt for no reason, so it stays opt-in.
+#
+# Every mapping must be IDEMPOTENT: the gateway may already speak the model's
+# dialect, and the miner has to be a no-op then rather than translating twice.
+_DIALECTS = {
+    "qwen3.8": {"effort": {"high": "xhigh", "max": "xhigh"},
+                "system_first_only": True},
+}
+# Neutral: forward what the buyer asked for, rewrite nothing. Any model without
+# a proven template quirk belongs here -- including DeepSeek-V4, whose efforts
+# are all valid upstream values.
+_DEFAULT_DIALECT = {"effort": {}, "system_first_only": False}
+
+
+def resolve_dialect(model: str | None, override: str | None = None) -> dict:
+    """The template dialect for the model this miner serves, matched on the engy
+    model id (`qwen3.8-27b` -> the `qwen3.8` entry).
+
+    `override` (--dialect / ENGY_TEMPLATE_DIALECT) names one explicitly, for a
+    model id the table does not know yet. An unrecognised name resolves to the
+    neutral default rather than raising: a miner that refuses to start is worse
+    than one that forwards the buyer's request unmodified."""
+    if override:
+        return _DIALECTS.get(override.strip().lower(), _DEFAULT_DIALECT)
+    name = (model or "").strip().lower()
+    for prefix, dialect in _DIALECTS.items():
+        if name.startswith(prefix):
+            return dialect
+    return _DEFAULT_DIALECT
+
+
 def _raise_with_body(r) -> None:
     """httpx raises on 4xx/5xx with only the status line and an MDN link, which
     hides what the serve actually said. Surface the body."""
@@ -527,10 +575,12 @@ class Serve:
       span scoring    -> /generate              (native, logprob_start_len)
     """
 
-    def __init__(self, urls: list[str], served_model: str, read_timeout: float):
+    def __init__(self, urls: list[str], served_model: str, read_timeout: float,
+                 dialect: dict | None = None):
         self.urls = urls
         self.served_model = served_model
         self.read_timeout = read_timeout
+        self.dialect = dialect or _DEFAULT_DIALECT
         self._n = {u: 0 for u in urls}
         self._down: set[str] = set()
         self._mtt: dict = {}   # per-serve KV pool size, cached (fixed per serve)
@@ -697,13 +747,29 @@ class Serve:
         return url.rstrip("/") if url.endswith("/v1") else url.rstrip("/") + "/v1"
 
     def _chat_body(self, request: dict, *, stream: bool) -> dict:
+        # Scrub for templates that reject a `system` message anywhere but
+        # position 0 -- see `_DIALECTS`. Off unless this model needs it: on a
+        # template that accepts mid-conversation system turns, demoting them
+        # silently rewrites the prompt.
+        msgs = request.get("messages", []) or []
+        if self.dialect["system_first_only"] and any(
+                m.get("role") == "system" for m in msgs[1:]):
+            msgs = [m if i == 0 or m.get("role") != "system"
+                    else {**m, "role": "user"}
+                    for i, m in enumerate(msgs)]
         body = {"model": self.served_model or request.get("model"),
-                "messages": request.get("messages", [])}
+                "messages": msgs}
         if request.get("max_tokens"):
             body["max_tokens"] = request["max_tokens"]
         for k in _PASSTHROUGH:
             if request.get(k) is not None:
                 body[k] = request[k]
+        # Translate the effort AFTER the passthrough copy, so the dialect maps
+        # the value that is actually on the wire. Unmapped efforts (and every
+        # effort on the neutral dialect) go upstream untouched.
+        effort = self.dialect["effort"].get(body.get("reasoning_effort"))
+        if effort:
+            body["reasoning_effort"] = effort
         if stream:
             body["stream"] = True
             body["stream_options"] = {"include_usage": True}
@@ -1342,6 +1408,9 @@ def main(argv=None):
     p.add_argument("--modalities", default=_env("ENGY_MODALITIES", "text"),
                    help="comma-separated input modalities the serve accepts, "
                         "e.g. 'text,image' for a VLM serve (default: text)")
+    p.add_argument("--dialect", default=_env("ENGY_TEMPLATE_DIALECT"),
+                   help="force a chat-template dialect (see _DIALECTS) instead "
+                        "of matching on the model id")
     p.add_argument("--require-tee-identity", action="store_true",
                    default=_env("ENGY_REQUIRE_TEE_IDENTITY") == "1",
                    help="exit rather than serve without a provider-assigned "
@@ -1384,7 +1453,8 @@ def main(argv=None):
         "worker_name": worker_name,
         "model_root": _model_root(args.checkpoint),
         "hw": _detect_hw(),
-        "backend": Serve(serve_urls, args.served_model, args.read_timeout),
+        "backend": Serve(serve_urls, args.served_model, args.read_timeout,
+                         resolve_dialect(args.model, args.dialect)),
         "hb_s": float(_env("ENGY_HEARTBEAT_S", "30")),
     }
 

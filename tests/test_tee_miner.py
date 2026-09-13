@@ -165,6 +165,84 @@ def test_close_note_still_reports_a_code_it_has_no_name_for():
     assert "4321" in note and "unspecified" in note
 
 
+# ---------------------------------------------------------- template dialects
+# The prod gateway normalizes every buyer `reasoning_effort` onto "high"/"max",
+# and Qwen3.8's chat template 400s on both. These pin the translation, and pin
+# just as hard that it stays OFF for every other model -- on DeepSeek-V4 the
+# same mapping would be silently discarded upstream and answer at the default.
+
+
+def _serve(model=None, override=None):
+    return tm.Serve(["http://x/v1"], "/model", 60.0,
+                    tm.resolve_dialect(model, override))
+
+
+def test_dialect_matches_on_the_engy_model_id_prefix():
+    assert tm.resolve_dialect("qwen3.8-27b")["system_first_only"] is True
+    assert tm.resolve_dialect("deepseek-v4-flash-0731") is tm._DEFAULT_DIALECT
+    assert tm.resolve_dialect("glm-5.2") is tm._DEFAULT_DIALECT
+    assert tm.resolve_dialect(None) is tm._DEFAULT_DIALECT
+
+
+def test_unknown_dialect_override_falls_back_instead_of_raising():
+    # A miner that refuses to start is worse than one that forwards unmodified.
+    assert tm.resolve_dialect("glm-5.2", "nope") is tm._DEFAULT_DIALECT
+    assert tm.resolve_dialect("glm-5.2", "qwen3.8")["system_first_only"] is True
+
+
+def test_qwen_effort_folds_onto_xhigh_and_is_idempotent():
+    s = _serve("qwen3.8-27b")
+    msgs = [{"role": "user", "content": "hi"}]
+    for sent, want in [("high", "xhigh"), ("max", "xhigh"), ("xhigh", "xhigh"),
+                       ("medium", "medium"), ("low", "low")]:
+        body = s._chat_body({"messages": msgs, "reasoning_effort": sent},
+                            stream=False)
+        assert body["reasoning_effort"] == want, sent
+    # No effort on the wire must not invent one.
+    assert "reasoning_effort" not in s._chat_body({"messages": msgs},
+                                                  stream=False)
+
+
+def test_other_models_keep_the_effort_the_buyer_asked_for():
+    msgs = [{"role": "user", "content": "hi"}]
+    for model in ("deepseek-v4-flash-0731", "glm-5.2", None):
+        s = _serve(model)
+        for eff in ("high", "max", "low"):
+            body = s._chat_body({"messages": msgs, "reasoning_effort": eff},
+                                stream=False)
+            assert body["reasoning_effort"] == eff, (model, eff)
+
+
+def test_qwen_demotes_only_mid_conversation_system_turns():
+    msgs = [{"role": "system", "content": "S0"},
+            {"role": "user", "content": "u1"},
+            {"role": "system", "content": "S-mid"}]
+    body = _serve("qwen3.8-27b")._chat_body({"messages": msgs}, stream=False)
+    assert body["messages"][0]["role"] == "system"     # position 0 survives
+    assert body["messages"][2]["role"] == "user"       # the mid one is demoted
+    assert body["messages"][2]["content"] == "S-mid"   # content is untouched
+    assert msgs[2]["role"] == "system"                 # caller's list unmutated
+
+
+def test_demotion_is_off_for_templates_that_accept_mid_system():
+    msgs = [{"role": "system", "content": "S0"},
+            {"role": "user", "content": "u1"},
+            {"role": "system", "content": "S-mid"}]
+    body = _serve("deepseek-v4-flash-0731")._chat_body({"messages": msgs},
+                                                       stream=False)
+    assert body["messages"][2]["role"] == "system"
+
+
+def test_dialect_does_not_disturb_the_rest_of_the_body():
+    s = _serve("qwen3.8-27b")
+    body = s._chat_body({"messages": [{"role": "user", "content": "hi"}],
+                         "max_tokens": 99, "temperature": 0.3, "tools": [1]},
+                        stream=True)
+    assert body["model"] == "/model"
+    assert body["max_tokens"] == 99 and body["temperature"] == 0.3
+    assert body["tools"] == [1]
+    assert body["stream"] is True
+    assert body["stream_options"] == {"include_usage": True}
 # ---- usage: the thinking-token count the gateway translates for buyers ----
 
 # verbatim from a prod qwen3.8-27b serve (m5-27:30001), reasoning_effort=medium
