@@ -367,6 +367,54 @@ _PASSTHROUGH = ("temperature", "top_p", "n", "stop", "presence_penalty",
 _TEXT_PASSTHROUGH = ("echo", "suffix", "best_of")
 
 
+# ---- chat-template dialects ----
+# One image serves the whole fleet, but the templates behind it are NOT
+# interchangeable: a quirk worked around for one model is a regression on
+# another, so every entry is opt-in per model rather than unconditional.
+#
+# * `effort` -- Qwen3.8's template accepts only xhigh (its default AND maximum) /
+#   medium / low and `raise_exception`s a 400 on anything else, so OpenAI's
+#   "high" and GLM's "max" have to fold onto xhigh. The prod gateway normalizes
+#   every buyer effort into exactly that pair, so without this map a Qwen3.8
+#   worker 400s most reasoning traffic. DeepSeek-V4 must NOT get the mapping:
+#   its ladder is a preamble sglang injects (`encoding_dsv4`), and an effort the
+#   active profile does not list is silently DROPPED to the profile default --
+#   "xhigh" there does not 400, it quietly answers at the default instead.
+# * `system_first_only` -- Qwen3.8 hard-rejects a `system` message anywhere but
+#   position 0 ("System message must be at the beginning"), which 400s clients
+#   that inject mid-conversation system turns (Claude Code after an auto-compact).
+#   Demoting those to `user` rescues the request there, but on a template that
+#   accepts them it rewrites the prompt for no reason, so it stays opt-in.
+#
+# Every mapping must be IDEMPOTENT: the gateway may already speak the model's
+# dialect, and the miner has to be a no-op then rather than translating twice.
+_DIALECTS = {
+    "qwen3.8": {"effort": {"high": "xhigh", "max": "xhigh"},
+                "system_first_only": True},
+}
+# Neutral: forward what the buyer asked for, rewrite nothing. Any model without
+# a proven template quirk belongs here -- including DeepSeek-V4, whose efforts
+# are all valid upstream values.
+_DEFAULT_DIALECT = {"effort": {}, "system_first_only": False}
+
+
+def resolve_dialect(model: str | None, override: str | None = None) -> dict:
+    """The template dialect for the model this miner serves, matched on the engy
+    model id (`qwen3.8-27b` -> the `qwen3.8` entry).
+
+    `override` (--dialect / ENGY_TEMPLATE_DIALECT) names one explicitly, for a
+    model id the table does not know yet. An unrecognised name resolves to the
+    neutral default rather than raising: a miner that refuses to start is worse
+    than one that forwards the buyer's request unmodified."""
+    if override:
+        return _DIALECTS.get(override.strip().lower(), _DEFAULT_DIALECT)
+    name = (model or "").strip().lower()
+    for prefix, dialect in _DIALECTS.items():
+        if name.startswith(prefix):
+            return dialect
+    return _DEFAULT_DIALECT
+
+
 def _raise_with_body(r) -> None:
     """httpx raises on 4xx/5xx with only the status line and an MDN link, which
     hides what the serve actually said. Surface the body."""
@@ -470,6 +518,23 @@ def _clean_usage(raw: dict) -> dict:
     if isinstance(details, dict) and details.get("cached_tokens") is not None:
         u["prompt_tokens_details"] = {
             "cached_tokens": int(details["cached_tokens"])}
+    # Thinking tokens, a SUBSET of completion_tokens. sglang reports this FLAT
+    # on `usage.reasoning_tokens` (its own UsageInfo field); the gateway edge
+    # translates it into OpenAI's nested `completion_tokens_details` before a
+    # buyer sees it, so the upstream dialect is kept here and converted once,
+    # in one place. Dropping it here is what made the count invisible: a live
+    # qwen3.8-27b answers 53 of 67 completion tokens on reasoning_effort=medium
+    # and none of it reached the buyer.
+    #
+    # Absent stays absent -- a serve with no reasoning parser reports nothing,
+    # and "we do not know" must not be forwarded as a zero.
+    reasoning = raw.get("reasoning_tokens")
+    if reasoning is None:
+        nested = raw.get("completion_tokens_details")
+        if isinstance(nested, dict):
+            reasoning = nested.get("reasoning_tokens")
+    if reasoning is not None:
+        u["reasoning_tokens"] = int(reasoning)
     return u
 
 
@@ -516,10 +581,12 @@ class Serve:
       span scoring    -> /generate              (native, logprob_start_len)
     """
 
-    def __init__(self, urls: list[str], served_model: str, read_timeout: float):
+    def __init__(self, urls: list[str], served_model: str, read_timeout: float,
+                 dialect: dict | None = None):
         self.urls = urls
         self.served_model = served_model
         self.read_timeout = read_timeout
+        self.dialect = dialect or _DEFAULT_DIALECT
         self._n = {u: 0 for u in urls}
         self._down: set[str] = set()
         self._mtt: dict = {}   # per-serve KV pool size, cached (fixed per serve)
@@ -580,6 +647,37 @@ class Serve:
         if len(down) < len(self.urls) and worst == "dead":
             worst = "ok"                   # another serve can still take work
         return worst
+
+    async def scheduler_alive(self, timeout: float = 3.0) -> bool:
+        """Is the SCHEDULER answering, even though /health did not?
+
+        /health round-trips through the detokenizer, so it stalls whenever the
+        detokenizer is merely behind — see `probe`. /get_load is served off the
+        scheduler's own state and does not, which is why it "never missed a
+        beat" through the kimi-k3 stalls: measured on an IDLE Ornith-1.5 serve
+        /get_load answered in 1.2 ms against /health's 1.0 s, ~800x apart.
+
+        True  -> at least one serve answered /get_load 200: the process is up
+                 and scheduling, so a /health stall is queueing, not a wedge.
+        False -> every serve failed to answer. That includes a serve too old to
+                 expose /get_load at all (404), which deliberately keeps the
+                 pre-existing withdraw-on-two-timeouts behaviour for it rather
+                 than inventing health it cannot see.
+
+        Never raises; only called on the timeout path, never on every probe."""
+        try:
+            async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(timeout, connect=2.0)) as c:
+                for u in self.urls:
+                    try:
+                        r = await c.get(self._root(u) + "/get_load")
+                        if r.status_code == 200 and isinstance(r.json(), list):
+                            return True
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return False
 
     def _release(self, u: str):
         self._n[u] = max(0, self._n.get(u, 0) - 1)
@@ -679,13 +777,29 @@ class Serve:
         return url.rstrip("/") if url.endswith("/v1") else url.rstrip("/") + "/v1"
 
     def _chat_body(self, request: dict, *, stream: bool) -> dict:
+        # Scrub for templates that reject a `system` message anywhere but
+        # position 0 -- see `_DIALECTS`. Off unless this model needs it: on a
+        # template that accepts mid-conversation system turns, demoting them
+        # silently rewrites the prompt.
+        msgs = request.get("messages", []) or []
+        if self.dialect["system_first_only"] and any(
+                m.get("role") == "system" for m in msgs[1:]):
+            msgs = [m if i == 0 or m.get("role") != "system"
+                    else {**m, "role": "user"}
+                    for i, m in enumerate(msgs)]
         body = {"model": self.served_model or request.get("model"),
-                "messages": request.get("messages", [])}
+                "messages": msgs}
         if request.get("max_tokens"):
             body["max_tokens"] = request["max_tokens"]
         for k in _PASSTHROUGH:
             if request.get(k) is not None:
                 body[k] = request[k]
+        # Translate the effort AFTER the passthrough copy, so the dialect maps
+        # the value that is actually on the wire. Unmapped efforts (and every
+        # effort on the neutral dialect) go upstream untouched.
+        effort = self.dialect["effort"].get(body.get("reasoning_effort"))
+        if effort:
+            body["reasoning_effort"] = effort
         if stream:
             body["stream"] = True
             body["stream_options"] = {"include_usage": True}
@@ -1135,16 +1249,112 @@ _HEALTH_OK_STREAK = 2
 # 72 s. At the 8 s timeout + 5 s interval cadence, 2 means ~26 s, just past
 # sglang's own 20 s detokenizer watchdog.
 _HEALTH_FAIL_STREAK = 2
+# ...and then only if the SCHEDULER has gone quiet too. A stall that /get_load
+# rides out still withdraws once it has lasted this long, so a genuinely wedged
+# serve — the known O(N^2) detokenizer hang keeps scheduling while it serves
+# nobody — is still caught. 120 s is ~4.6x the old trip point and past every
+# self-clearing stall on record (13-19 s typical, 72 s worst), so it is a
+# backstop, not the primary detector.
+_HEALTH_STALL_MAX_S = 120.0
+# While riding a stall out, say so at most this often.
+_HEALTH_NOTE_S = 30.0
+
+
+class _HealthGate:
+    """Should the miner be withdrawn right now? One probe outcome per tick.
+
+    The three probe outcomes are not symmetric:
+
+    - 'dead'    connection refused/reset or /health non-200. Unambiguous, and
+                back in milliseconds — withdraw on the first one.
+    - 'ok'      clears the gate; reconnect after _HEALTH_OK_STREAK of them.
+    - 'timeout' NOT proof of anything. sglang's /health round-trips through the
+                DETOKENIZER, so it stalls whenever the detokenizer is behind,
+                which a healthy worker does routinely. Withdrawing on two of
+                them cancels every leg, and the gateway books each in-flight
+                request as `504 miner timeout or disconnect`: all 5 of the 504s
+                the Ornith canary served across 1183 requests were this, with
+                no backend fault behind any of them (the largest prompt in any
+                failure window was 379 tokens, and a 1421-request load test
+                never tripped it once).
+
+    So on a timeout, ask the scheduler directly via /get_load before believing
+    /health. If it answers, the backend is alive and busy, not dead: stay up
+    and let the in-flight work finish. Only a stall where /get_load has gone
+    quiet TOO, or one that outlasts _HEALTH_STALL_MAX_S however lively
+    /get_load looks, is treated as a fault."""
+
+    def __init__(self, backend, *, clock=time.monotonic):
+        self._backend = backend
+        self._clock = clock
+        self.down = False
+        self.ok_streak = 0
+        self.fail_streak = 0
+        self._stall_since = None
+        self._last_note = 0.0
+
+    async def update(self, state: str) -> bool:
+        """Fold in one probe outcome; returns True while legs must stay down."""
+        if state == "ok":
+            self.ok_streak += 1
+            self.fail_streak = 0
+            self._stall_since = None
+            self._last_note = 0.0
+            if self.down and self.ok_streak >= _HEALTH_OK_STREAK:
+                self.down = False
+                print("[tee_miner] backend RECOVERED — reconnecting legs",
+                      flush=True)
+            return self.down
+        self.ok_streak = 0
+        self.fail_streak += 1
+        now = self._clock()
+        if self._stall_since is None:
+            self._stall_since = now
+        if self.down:
+            return True      # already withdrawn; recovery is ok_streak's job
+        why = await self._verdict(state, now - self._stall_since)
+        if why:
+            self.down = True
+            print("[tee_miner] backend UNHEALTHY (%s) — disconnecting all legs"
+                  % why, flush=True)
+        return self.down
+
+    async def _verdict(self, state: str, stalled: float):
+        """A reason to withdraw, or None to stay up. Consults /get_load ONLY
+        once /health has timed out _HEALTH_FAIL_STREAK times running."""
+        if state == "dead":
+            return "dead"
+        if self.fail_streak < _HEALTH_FAIL_STREAK:
+            return None
+        if not await self._backend.scheduler_alive():
+            return ("/health timeout x%d for %.0fs and /get_load silent too"
+                    % (self.fail_streak, stalled))
+        if stalled >= _HEALTH_STALL_MAX_S:
+            return ("/health timeout x%d — /get_load still answers, but %.0fs "
+                    "of stall is a wedge" % (self.fail_streak, stalled))
+        self._note(stalled)
+        return None
+
+    def _note(self, stalled: float):
+        now = self._clock()
+        if self._last_note and now - self._last_note < _HEALTH_NOTE_S:
+            return
+        self._last_note = now
+        print("[tee_miner] /health stalled %.0fs (timeout x%d) but /get_load "
+              "answers — scheduler alive, staying up"
+              % (stalled, self.fail_streak), flush=True)
 
 
 async def _supervise(cfg, capacity: dict, load: Load):
     """Leg supervisor, ported from the reference miner.
 
     Two jobs beyond keeping N legs dialed:
-    - Backend health gate: when the serve OOMs or wedges, DISCONNECT every leg
-      so the gateway stops routing buyers here (the alternative is advertising
-      a dead backend and 502ing everything). Reconnect only after
-      _HEALTH_OK_STREAK consecutive good probes.
+    - Backend health gate (_HealthGate): when the serve OOMs or wedges,
+      DISCONNECT every leg so the gateway stops routing buyers here (the
+      alternative is advertising a dead backend and 502ing everything). A
+      /health stall alone is not that — it is confirmed against /get_load
+      first, since cancelling legs 504s whatever they were serving. Reconnect
+      only after _HEALTH_OK_STREAK consecutive good probes.
     - Incremental leg management keyed by worker INDEX: a gateway scale event
       adds legs for new workers and drops legs for removed ones, but never
       touches an existing leg — cancelling a live leg 504s its streams.
@@ -1161,33 +1371,10 @@ async def _supervise(cfg, capacity: dict, load: Load):
         if fetched is not None:
             break
         await asyncio.sleep(1.0)
-    backend_down = False
-    ok_streak = 0
-    fail_streak = 0
+    gate = _HealthGate(backend)
     try:
         while True:
-            state = await backend.probe()
-            if state == "ok":
-                ok_streak += 1
-                fail_streak = 0
-                if backend_down and ok_streak >= _HEALTH_OK_STREAK:
-                    backend_down = False
-                    print("[tee_miner] backend RECOVERED — reconnecting legs",
-                          flush=True)
-            else:
-                ok_streak = 0
-                fail_streak += 1
-                # 'dead' is unambiguous, so act on the first one. A timeout is
-                # not, so require it to persist: one missed probe is the normal
-                # noise of a busy front-end, and dropping every leg over it
-                # withdraws a healthy worker exactly when the fleet is busiest.
-                trip = state == "dead" or fail_streak >= _HEALTH_FAIL_STREAK
-                if trip and not backend_down:
-                    backend_down = True
-                    print("[tee_miner] backend UNHEALTHY (%s x%d) — "
-                          "disconnecting all legs" % (state, fail_streak),
-                          flush=True)
-            if backend_down:
+            if await gate.update(await backend.probe()):
                 if legs:
                     for t in legs.values():
                         t.cancel()
@@ -1251,6 +1438,9 @@ def main(argv=None):
     p.add_argument("--modalities", default=_env("ENGY_MODALITIES", "text"),
                    help="comma-separated input modalities the serve accepts, "
                         "e.g. 'text,image' for a VLM serve (default: text)")
+    p.add_argument("--dialect", default=_env("ENGY_TEMPLATE_DIALECT"),
+                   help="force a chat-template dialect (see _DIALECTS) instead "
+                        "of matching on the model id")
     p.add_argument("--require-tee-identity", action="store_true",
                    default=_env("ENGY_REQUIRE_TEE_IDENTITY") == "1",
                    help="exit rather than serve without a provider-assigned "
@@ -1293,7 +1483,8 @@ def main(argv=None):
         "worker_name": worker_name,
         "model_root": _model_root(args.checkpoint),
         "hw": _detect_hw(),
-        "backend": Serve(serve_urls, args.served_model, args.read_timeout),
+        "backend": Serve(serve_urls, args.served_model, args.read_timeout,
+                         resolve_dialect(args.model, args.dialect)),
         "hb_s": float(_env("ENGY_HEARTBEAT_S", "30")),
     }
 
