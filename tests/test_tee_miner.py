@@ -539,3 +539,72 @@ def test_the_ridden_out_stall_is_logged_at_most_once_a_note_interval(capsys):
     notes = [ln for ln in capsys.readouterr().out.splitlines()
              if "staying up" in ln]
     assert 2 <= len(notes) <= 8      # paced, not silenced
+
+
+# ---- chat logprobs across a stream --------------------------------------------
+# sglang streams one chunk per decode step; with speculative decoding one step
+# can accept several tokens, so a chunk carries several logprobs entries. The
+# stop token arrives with an empty delta but its own entry.
+
+def _lp(*toks):
+    return {"content": [{"token": t, "logprob": -0.1,
+                         "top_logprobs": [{"token": t, "logprob": -0.1}]}
+                        for t in toks]}
+
+
+_CHUNKS = [
+    {"choices": [{"delta": {"role": "assistant", "content": ""}, "logprobs": None}]},
+    {"choices": [{"delta": {"content": "alpha"}, "logprobs": _lp("alpha")}]},
+    {"choices": [{"delta": {"content": " br"}, "logprobs": _lp(" br")}]},
+    {"choices": [{"delta": {"content": "avo charlie delta"},
+                  "logprobs": _lp("avo", " char", "lie", " delta")}]},
+    {"choices": [{"delta": {}, "logprobs": _lp("<|user|>"), "finish_reason": "stop"}]},
+    {"choices": [], "usage": {"prompt_tokens": 9, "completion_tokens": 7}},
+]
+
+
+def _stream_serve(monkeypatch, chunks):
+    import httpx
+    body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+    transport = httpx.MockTransport(lambda req: httpx.Response(
+        200, text=body, headers={"content-type": "text/event-stream"}))
+    real = httpx.AsyncClient
+    monkeypatch.setattr(tm.httpx, "AsyncClient",
+                        lambda *a, **k: real(*a, **{**k, "transport": transport}))
+    return _serve("glm-5.2")
+
+
+def _collect(serve, request):
+    async def go():
+        return [ev async for ev in serve.stream(request)]
+    return asyncio.run(go())
+
+
+def test_non_streaming_answer_carries_every_chunks_logprobs(monkeypatch):
+    evs = _collect(_stream_serve(monkeypatch, _CHUNKS),
+                   {"model": "glm-5.2", "messages": [], "logprobs": True, "top_logprobs": 3})
+    done = [p for k, p in evs if k == "done"][0]
+    toks = [e["token"] for e in done["choices"][0]["logprobs"]["content"]]
+    # was: only the LAST chunk's block, i.e. ["<|user|>"] (1 of 7), or the
+    # last multi-token chunk (5 of 7) when the stop token rode along
+    assert toks == ["alpha", " br", "avo", " char", "lie", " delta", "<|user|>"]
+    assert len(toks) == done["usage"]["completion_tokens"]
+
+
+def test_streaming_forwards_logprobs_on_a_chunk_with_no_text(monkeypatch):
+    evs = _collect(_stream_serve(monkeypatch, _CHUNKS),
+                   {"model": "glm-5.2", "messages": [], "logprobs": True, "top_logprobs": 3})
+    streamed = [e["token"] for k, p in evs if k == "delta" and p.get("logprobs")
+                for e in p["logprobs"]["content"]]
+    assert streamed == ["alpha", " br", "avo", " char", "lie", " delta", "<|user|>"]
+    # an empty chunk with no logprobs still produces no event
+    assert all(p["delta"] or p.get("logprobs") for k, p in evs if k == "delta")
+
+
+def test_no_logprobs_requested_means_none_on_the_answer(monkeypatch):
+    plain = [{"choices": [{"delta": {"content": "hi"}}]},
+             {"choices": [{"delta": {}, "finish_reason": "stop"}]}]
+    evs = _collect(_stream_serve(monkeypatch, plain), {"model": "glm-5.2", "messages": []})
+    done = [p for k, p in evs if k == "done"][0]
+    assert done["choices"][0].get("logprobs") is None
+    assert [p["delta"] for k, p in evs if k == "delta"] == [{"content": "hi"}]

@@ -509,6 +509,24 @@ def _assistant_message(msg: dict) -> dict:
     return out
 
 
+def _merge_logprobs(acc: dict | None, lp) -> dict | None:
+    """Append one streamed chunk's choice-level logprobs to the running total.
+
+    OpenAI chat logprobs are `{"content": [...], "refusal": [...]}`, one entry
+    per token; a stream splits them across chunks, so the non-streaming answer
+    is the concatenation, never any single chunk's block."""
+    if not isinstance(lp, dict):
+        return acc
+    if acc is None:
+        acc = {}
+    for key, entries in lp.items():
+        if isinstance(entries, list):
+            acc.setdefault(key, []).extend(entries)
+        elif key not in acc:
+            acc[key] = entries
+    return acc
+
+
 def _clean_usage(raw: dict) -> dict:
     u = {"prompt_tokens": int(raw.get("prompt_tokens") or 0),
          "completion_tokens": int(raw.get("completion_tokens") or 0)}
@@ -950,14 +968,22 @@ class Serve:
                                 tool_calls = _merge_tool_calls(
                                     tool_calls, d["tool_calls"])
                                 out["tool_calls"] = d["tool_calls"]
-                            if ch.get("logprobs") is not None:
-                                logprobs_seen = ch["logprobs"]
-                            if out:
-                                # choice-level logprobs ride beside the delta so
-                                # a streaming buyer gets them per chunk, not
-                                # just on the terminal frame
-                                yield "delta", {"delta": out,
-                                                "logprobs": ch.get("logprobs")}
+                            lp = ch.get("logprobs")
+                            # Every chunk's entries belong to the answer. The
+                            # serve sends one chunk per decode step, and with
+                            # speculative decoding a step can carry several
+                            # tokens, so keeping only the last chunk's block
+                            # (as this did) left a non-streaming buyer 5 of 7
+                            # entries, or 1 of 7, all shifted off their tokens.
+                            logprobs_seen = _merge_logprobs(logprobs_seen, lp)
+                            if out or lp:
+                                # `out or lp`, not `out`: a chunk can carry the
+                                # logprobs of a token that adds no visible text
+                                # (the stop token, an empty delta), and dropping
+                                # it shifts every later top_logprobs[i] onto the
+                                # wrong token for a streaming scorer. Choice-level
+                                # logprobs ride beside the delta, per chunk.
+                                yield "delta", {"delta": out, "logprobs": lp}
                             if ch.get("finish_reason"):
                                 finish = ch["finish_reason"]
         finally:
