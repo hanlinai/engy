@@ -608,3 +608,77 @@ def test_no_logprobs_requested_means_none_on_the_answer(monkeypatch):
     done = [p for k, p in evs if k == "done"][0]
     assert done["choices"][0].get("logprobs") is None
     assert [p["delta"] for k, p in evs if k == "delta"] == [{"content": "hi"}]
+
+
+# ---- non-streaming buyers who want logprobs ----------------------------------
+
+class RecordingBackend(FakeBackend):
+    def __init__(self):
+        self.used = []
+
+    async def stream(self, request):
+        self.used.append("stream")
+        async for ev in FakeBackend.stream(self, request):
+            yield ev
+
+    async def chat_once(self, request):
+        self.used.append("chat_once")
+        return {"id": "chatcmpl-y", "choices": [], "usage": {}}
+
+
+def _route(frame_extra, request_extra):
+    b, ws, load = RecordingBackend(), FakeWS(), tm.Load()
+    frame = {"corr_id": "c1", **frame_extra,
+             "request": {"messages": [{"role": "user", "content": "hi"}], **request_extra}}
+    asyncio.run(tm._serve_one(ws, frame, b, load))
+    return b.used
+
+
+def test_non_streaming_logprobs_request_asks_the_engine_non_streaming():
+    assert _route({"stream": False}, {"logprobs": True}) == ["chat_once"]
+    assert _route({"stream": False}, {"top_logprobs": 5}) == ["chat_once"]
+
+
+def test_every_other_chat_request_keeps_the_streaming_path():
+    assert _route({"stream": True}, {"logprobs": True}) == ["stream"]
+    assert _route({"stream": False}, {}) == ["stream"]
+    # a gateway that predates the flag: stay on the known-good default
+    assert _route({}, {"logprobs": True}) == ["stream"]
+
+
+def test_chat_once_returns_the_engines_own_per_token_logprobs(monkeypatch):
+    import httpx
+    engine = {"choices": [{"message": {"role": "assistant", "content": "alpha bravo",
+                                       "reasoning_content": None},
+                           "logprobs": _lp("alpha", " br", "avo"),
+                           "finish_reason": "stop"}],
+              "usage": {"prompt_tokens": 9, "completion_tokens": 3}}
+    seen = {}
+
+    def handler(req):
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json=engine)
+    real = httpx.AsyncClient
+    monkeypatch.setattr(tm.httpx, "AsyncClient",
+                        lambda *a, **k: real(*a, **{**k, "transport": httpx.MockTransport(handler)}))
+    out = asyncio.run(_serve("glm-5.2").chat_once(
+        {"model": "glm-5.2", "messages": [], "logprobs": True, "top_logprobs": 3}))
+    assert "stream" not in seen["body"]
+    assert seen["body"]["top_logprobs"] == 3
+    ch = out["choices"][0]
+    assert [e["token"] for e in ch["logprobs"]["content"]] == ["alpha", " br", "avo"]
+    assert ch["message"]["content"] == "alpha bravo"
+    assert out["usage"]["completion_tokens"] == 3
+
+
+def test_chat_once_surfaces_an_engine_error(monkeypatch):
+    import httpx
+    real = httpx.AsyncClient
+    monkeypatch.setattr(tm.httpx, "AsyncClient", lambda *a, **k: real(*a, **{
+        **k, "transport": httpx.MockTransport(lambda r: httpx.Response(400, text="bad top_logprobs"))}))
+    try:
+        asyncio.run(_serve("glm-5.2").chat_once({"model": "glm-5.2", "messages": [], "logprobs": True}))
+    except tm.ServeError as e:
+        assert "bad top_logprobs" in str(e) or getattr(e, "detail", "")
+    else:
+        raise AssertionError("expected ServeError")
