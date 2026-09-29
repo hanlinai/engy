@@ -46,11 +46,16 @@ no extra hops.
    reference config).
 3. Start the miner, pointing it at your serve and checkpoint:
 
-       GW=wss://api.engy.ai/gw MINER_KEY=<your-key> MODEL=qwen3.6-35b-a3b \
+       GW=wss://lb.engy.ai/gw MINER_KEY=<your-key> MODEL=qwen3.6-35b-a3b \
        MAX_INFLIGHT=<serve concurrency, minimum 8> \
        python miner/engy_miner.py \
            --checkpoint /data/models/Qwen/Qwen3.6-35B-A3B-FP8 \
            --serve-url  http://127.0.0.1:8000
+
+`wss://lb.engy.ai/gw` is the recommended miner endpoint: a dedicated load
+balancer for miner connections, with fewer dropped connections than the
+shared `api.engy.ai` edge. If your network cannot reach it (some mainland
+China networks cannot), use `wss://api.engy.ai/gw` instead.
 
 `MAX_INFLIGHT`, the total number of requests your serve can run at once, is
 the one capacity number a miner declares. The gateway requires a minimum of 8.

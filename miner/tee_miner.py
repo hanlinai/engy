@@ -26,7 +26,9 @@ Identity, read from the environment automatically:
 
 Configuration:
 
-  ENGY_GW_URL          gateway websocket base   (default wss://api.engy.ai/gw)
+  ENGY_GW_URL          gateway websocket base   (default wss://api.engy.ai/gw;
+                       recommended wss://lb.engy.ai/gw, the dedicated miner
+                       endpoint, where your network can reach it)
   ENGY_MODEL           model name to advertise  (default glm-5.2)
   ENGY_SERVE_URL       local serve base url, comma-separated for several
                                                 (default http://127.0.0.1:8000)
