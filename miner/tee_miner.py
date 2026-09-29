@@ -511,6 +511,24 @@ def _assistant_message(msg: dict) -> dict:
     return out
 
 
+def _merge_logprobs(acc: dict | None, lp) -> dict | None:
+    """Append one streamed chunk's choice-level logprobs to the running total.
+
+    OpenAI chat logprobs are `{"content": [...], "refusal": [...]}`, one entry
+    per token; a stream splits them across chunks, so the non-streaming answer
+    is the concatenation, never any single chunk's block."""
+    if not isinstance(lp, dict):
+        return acc
+    if acc is None:
+        acc = {}
+    for key, entries in lp.items():
+        if isinstance(entries, list):
+            acc.setdefault(key, []).extend(entries)
+        elif key not in acc:
+            acc[key] = entries
+    return acc
+
+
 def _clean_usage(raw: dict) -> dict:
     u = {"prompt_tokens": int(raw.get("prompt_tokens") or 0),
          "completion_tokens": int(raw.get("completion_tokens") or 0)}
@@ -903,6 +921,38 @@ class Serve:
         finally:
             self._release(url)
 
+    async def chat_once(self, request: dict) -> dict:
+        """One non-streaming chat call, for a buyer who asked for logprobs and
+        is not streaming.
+
+        Assembling that answer from the serve's own stream is wrong on any
+        engine whose streaming path mis-attributes top_logprobs: sglang's
+        streaming logprobs read row 0 of a chunk for every token in it, and
+        speculative decoding puts several tokens in a chunk (seen on the GLM
+        rings 2026-09-26: 4 of 7 top-1 wrong in the stream, all 7 right
+        non-streaming on the same engine). The engine's non-streaming answer
+        indexes each token's own row, so ask it for that. Everything else keeps
+        the streaming path, whose keepalive and cancellation behaviour is
+        unchanged."""
+        url = self._pick()
+        timeout = httpx.Timeout(self.read_timeout, connect=10.0)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as c:
+                r = await c.post(self._v1(url) + "/chat/completions",
+                                 json=self._chat_body(request, stream=False))
+                if r.status_code >= 400:
+                    detail = r.text
+                    raise ServeError(_client_facing_status(r.status_code, detail),
+                                     detail[:600])
+                j = r.json()
+        finally:
+            self._release(url)
+        choice = (j.get("choices") or [{}])[0]
+        return _chat_completion(
+            request.get("model"), _assistant_message(choice.get("message") or {}),
+            _clean_usage(j.get("usage") or {}),
+            choice.get("finish_reason") or "stop", choice.get("logprobs"))
+
     async def stream(self, request: dict):
         """Yield ("delta", delta_dict) as the serve produces tokens, then
         ("done", output) once with the assembled OpenAI-shaped body."""
@@ -952,14 +1002,22 @@ class Serve:
                                 tool_calls = _merge_tool_calls(
                                     tool_calls, d["tool_calls"])
                                 out["tool_calls"] = d["tool_calls"]
-                            if ch.get("logprobs") is not None:
-                                logprobs_seen = ch["logprobs"]
-                            if out:
-                                # choice-level logprobs ride beside the delta so
-                                # a streaming buyer gets them per chunk, not
-                                # just on the terminal frame
-                                yield "delta", {"delta": out,
-                                                "logprobs": ch.get("logprobs")}
+                            lp = ch.get("logprobs")
+                            # Every chunk's entries belong to the answer. The
+                            # serve sends one chunk per decode step, and with
+                            # speculative decoding a step can carry several
+                            # tokens, so keeping only the last chunk's block
+                            # (as this did) left a non-streaming buyer 5 of 7
+                            # entries, or 1 of 7, all shifted off their tokens.
+                            logprobs_seen = _merge_logprobs(logprobs_seen, lp)
+                            if out or lp:
+                                # `out or lp`, not `out`: a chunk can carry the
+                                # logprobs of a token that adds no visible text
+                                # (the stop token, an empty delta), and dropping
+                                # it shifts every later top_logprobs[i] onto the
+                                # wrong token for a streaming scorer. Choice-level
+                                # logprobs ride beside the delta, per chunk.
+                                yield "delta", {"delta": out, "logprobs": lp}
                             if ch.get("finish_reason"):
                                 finish = ch["finish_reason"]
         finally:
@@ -993,6 +1051,13 @@ async def _serve_one(ws, frame, backend: Serve, load: Load):
             # score is meaningless: max_tokens is 0 and the payload is the
             # logprob array, not tokens.
             output = await backend.complete(request)
+            await ws.send(json.dumps(P.response(corr, rid, {}, output=output)))
+        elif (frame.get("stream") is False and hasattr(backend, "chat_once")
+              and (request.get("logprobs") or request.get("top_logprobs"))):
+            # Non-streaming buyer who wants logprobs: see Serve.chat_once.
+            # `is False`, not falsy: a gateway that predates the flag sends no
+            # key, and then the streaming path stays the safe default.
+            output = await backend.chat_once(request)
             await ws.send(json.dumps(P.response(corr, rid, {}, output=output)))
         else:
             async for kind, payload in backend.stream(request):

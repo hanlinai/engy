@@ -539,3 +539,146 @@ def test_the_ridden_out_stall_is_logged_at_most_once_a_note_interval(capsys):
     notes = [ln for ln in capsys.readouterr().out.splitlines()
              if "staying up" in ln]
     assert 2 <= len(notes) <= 8      # paced, not silenced
+
+
+# ---- chat logprobs across a stream --------------------------------------------
+# sglang streams one chunk per decode step; with speculative decoding one step
+# can accept several tokens, so a chunk carries several logprobs entries. The
+# stop token arrives with an empty delta but its own entry.
+
+def _lp(*toks):
+    return {"content": [{"token": t, "logprob": -0.1,
+                         "top_logprobs": [{"token": t, "logprob": -0.1}]}
+                        for t in toks]}
+
+
+_CHUNKS = [
+    {"choices": [{"delta": {"role": "assistant", "content": ""}, "logprobs": None}]},
+    {"choices": [{"delta": {"content": "alpha"}, "logprobs": _lp("alpha")}]},
+    {"choices": [{"delta": {"content": " br"}, "logprobs": _lp(" br")}]},
+    {"choices": [{"delta": {"content": "avo charlie delta"},
+                  "logprobs": _lp("avo", " char", "lie", " delta")}]},
+    {"choices": [{"delta": {}, "logprobs": _lp("<|user|>"), "finish_reason": "stop"}]},
+    {"choices": [], "usage": {"prompt_tokens": 9, "completion_tokens": 7}},
+]
+
+
+def _stream_serve(monkeypatch, chunks):
+    import httpx
+    body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+    transport = httpx.MockTransport(lambda req: httpx.Response(
+        200, text=body, headers={"content-type": "text/event-stream"}))
+    real = httpx.AsyncClient
+    monkeypatch.setattr(tm.httpx, "AsyncClient",
+                        lambda *a, **k: real(*a, **{**k, "transport": transport}))
+    return _serve("glm-5.2")
+
+
+def _collect(serve, request):
+    async def go():
+        return [ev async for ev in serve.stream(request)]
+    return asyncio.run(go())
+
+
+def test_non_streaming_answer_carries_every_chunks_logprobs(monkeypatch):
+    evs = _collect(_stream_serve(monkeypatch, _CHUNKS),
+                   {"model": "glm-5.2", "messages": [], "logprobs": True, "top_logprobs": 3})
+    done = [p for k, p in evs if k == "done"][0]
+    toks = [e["token"] for e in done["choices"][0]["logprobs"]["content"]]
+    # was: only the LAST chunk's block, i.e. ["<|user|>"] (1 of 7), or the
+    # last multi-token chunk (5 of 7) when the stop token rode along
+    assert toks == ["alpha", " br", "avo", " char", "lie", " delta", "<|user|>"]
+    assert len(toks) == done["usage"]["completion_tokens"]
+
+
+def test_streaming_forwards_logprobs_on_a_chunk_with_no_text(monkeypatch):
+    evs = _collect(_stream_serve(monkeypatch, _CHUNKS),
+                   {"model": "glm-5.2", "messages": [], "logprobs": True, "top_logprobs": 3})
+    streamed = [e["token"] for k, p in evs if k == "delta" and p.get("logprobs")
+                for e in p["logprobs"]["content"]]
+    assert streamed == ["alpha", " br", "avo", " char", "lie", " delta", "<|user|>"]
+    # an empty chunk with no logprobs still produces no event
+    assert all(p["delta"] or p.get("logprobs") for k, p in evs if k == "delta")
+
+
+def test_no_logprobs_requested_means_none_on_the_answer(monkeypatch):
+    plain = [{"choices": [{"delta": {"content": "hi"}}]},
+             {"choices": [{"delta": {}, "finish_reason": "stop"}]}]
+    evs = _collect(_stream_serve(monkeypatch, plain), {"model": "glm-5.2", "messages": []})
+    done = [p for k, p in evs if k == "done"][0]
+    assert done["choices"][0].get("logprobs") is None
+    assert [p["delta"] for k, p in evs if k == "delta"] == [{"content": "hi"}]
+
+
+# ---- non-streaming buyers who want logprobs ----------------------------------
+
+class RecordingBackend(FakeBackend):
+    def __init__(self):
+        self.used = []
+
+    async def stream(self, request):
+        self.used.append("stream")
+        async for ev in FakeBackend.stream(self, request):
+            yield ev
+
+    async def chat_once(self, request):
+        self.used.append("chat_once")
+        return {"id": "chatcmpl-y", "choices": [], "usage": {}}
+
+
+def _route(frame_extra, request_extra):
+    b, ws, load = RecordingBackend(), FakeWS(), tm.Load()
+    frame = {"corr_id": "c1", **frame_extra,
+             "request": {"messages": [{"role": "user", "content": "hi"}], **request_extra}}
+    asyncio.run(tm._serve_one(ws, frame, b, load))
+    return b.used
+
+
+def test_non_streaming_logprobs_request_asks_the_engine_non_streaming():
+    assert _route({"stream": False}, {"logprobs": True}) == ["chat_once"]
+    assert _route({"stream": False}, {"top_logprobs": 5}) == ["chat_once"]
+
+
+def test_every_other_chat_request_keeps_the_streaming_path():
+    assert _route({"stream": True}, {"logprobs": True}) == ["stream"]
+    assert _route({"stream": False}, {}) == ["stream"]
+    # a gateway that predates the flag: stay on the known-good default
+    assert _route({}, {"logprobs": True}) == ["stream"]
+
+
+def test_chat_once_returns_the_engines_own_per_token_logprobs(monkeypatch):
+    import httpx
+    engine = {"choices": [{"message": {"role": "assistant", "content": "alpha bravo",
+                                       "reasoning_content": None},
+                           "logprobs": _lp("alpha", " br", "avo"),
+                           "finish_reason": "stop"}],
+              "usage": {"prompt_tokens": 9, "completion_tokens": 3}}
+    seen = {}
+
+    def handler(req):
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json=engine)
+    real = httpx.AsyncClient
+    monkeypatch.setattr(tm.httpx, "AsyncClient",
+                        lambda *a, **k: real(*a, **{**k, "transport": httpx.MockTransport(handler)}))
+    out = asyncio.run(_serve("glm-5.2").chat_once(
+        {"model": "glm-5.2", "messages": [], "logprobs": True, "top_logprobs": 3}))
+    assert "stream" not in seen["body"]
+    assert seen["body"]["top_logprobs"] == 3
+    ch = out["choices"][0]
+    assert [e["token"] for e in ch["logprobs"]["content"]] == ["alpha", " br", "avo"]
+    assert ch["message"]["content"] == "alpha bravo"
+    assert out["usage"]["completion_tokens"] == 3
+
+
+def test_chat_once_surfaces_an_engine_error(monkeypatch):
+    import httpx
+    real = httpx.AsyncClient
+    monkeypatch.setattr(tm.httpx, "AsyncClient", lambda *a, **k: real(*a, **{
+        **k, "transport": httpx.MockTransport(lambda r: httpx.Response(400, text="bad top_logprobs"))}))
+    try:
+        asyncio.run(_serve("glm-5.2").chat_once({"model": "glm-5.2", "messages": [], "logprobs": True}))
+    except tm.ServeError as e:
+        assert "bad top_logprobs" in str(e) or getattr(e, "detail", "")
+    else:
+        raise AssertionError("expected ServeError")
