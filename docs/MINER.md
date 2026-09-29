@@ -1,5 +1,9 @@
 # engy-miner — running a verifiable-inference miner
 
+> **Start here: [provider.engy.ai/dashboard/docs](https://provider.engy.ai/dashboard/docs).**
+> That is the official onboarding guide: get a miner key, build and boot your box, and
+> watch it register. This page is the reference for running the miner process by hand.
+
 The miner in [`miner/`](../miner/) serves buyer requests routed from a gateway on
 a local sglang serve and returns, with each completion, a compact **TOPLOC**
 proof that the response really came from the model it claims to run. A validator
