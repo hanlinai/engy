@@ -124,7 +124,12 @@ python miner/engy_miner.py \
 `--serve-url` takes one URL, or several comma-separated (the miner
 least-in-flight balances across them).
 
-The gateway-host is `api.engy.ai`.
+The recommended gateway-host is **`lb.engy.ai`** (`GW=wss://lb.engy.ai/gw`), a dedicated
+load balancer for miner connections. It drops fewer connections than the shared
+`api.engy.ai` edge and passes the gateway's close codes through, so the miner sees a
+clean `1012 service restart` during a gateway deploy instead of an opaque `1006`.
+If your network cannot reach `lb.engy.ai` (some mainland China networks cannot),
+use `GW=wss://api.engy.ai/gw`; both reach the same gateway.
 
 **The only capacity a miner declares is `MAX_INFLIGHT` — how many requests it can
 run at once. The gateway requires a minimum of 8.** It is a *total*: the miner splits it across the legs it opens and
