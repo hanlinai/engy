@@ -120,6 +120,14 @@ def test_drain_grace_outlives_the_upstream_read_timeout():
     assert tm.DRAIN_GRACE_S >= float(tm._env("ENGY_READ_TIMEOUT", "1800"))
 
 
+def test_heartbeat_refreshes_kv_inside_the_gateway_kv_ttl():
+    """KV rides only on the periodic heartbeat, and the gateway fails its KV
+    gate open on a report older than ENGY_KV_TTL_S (15 s by default). A period
+    at or past that TTL leaves a full serve admitted for part of every cycle."""
+    gateway_kv_ttl_s = 15.0
+    assert tm.HEARTBEAT_S < gateway_kv_ttl_s
+
+
 def test_retire_defaults_to_the_configured_grace():
     import inspect
     default = inspect.signature(tm._retire).parameters["grace"].default

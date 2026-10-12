@@ -171,6 +171,14 @@ def _env(key, default=None):
 DRAIN_GRACE_S = float(_env("ENGY_DRAIN_GRACE_S",
                            _env("ENGY_READ_TIMEOUT", "1800")))
 
+# Period of the leg's heartbeat, and so the freshness of its KV report. Only
+# this periodic frame samples KV: the in-flight broadcast deliberately omits it
+# to keep `kv_load()` off the request path. The gateway's KV gate treats a
+# report older than ENGY_KV_TTL_S (15 s by default) as stale and FAILS OPEN, so
+# a 30 s period left the gate disarmed for half of every cycle, and a full serve
+# kept being admitted. 10 s stays inside that TTL with room for a late frame.
+HEARTBEAT_S = float(_env("ENGY_HEARTBEAT_S", "10"))
+
 
 # -------------------------------------------------------------------- identity
 def _resolve_miner_key(explicit: str | None) -> str:
@@ -1076,7 +1084,7 @@ async def _session(ws, cfg, cap, load: Load, tag: str) -> bool:
     print(f"[tee_miner] {tag} HELLO sent (max_inflight={cap['max_inflight']})",
           flush=True)
     hb = asyncio.create_task(
-        _heartbeat(ws, cfg.get("hb_s", 30.0), load, cap, cfg["backend"]))
+        _heartbeat(ws, cfg.get("hb_s", HEARTBEAT_S), load, cap, cfg["backend"]))
     serving: dict[str, asyncio.Task] = {}
     drained = False
     try:
@@ -1487,7 +1495,7 @@ def main(argv=None):
         "hw": _detect_hw(),
         "backend": Serve(serve_urls, args.served_model, args.read_timeout,
                          resolve_dialect(args.model, args.dialect)),
-        "hb_s": float(_env("ENGY_HEARTBEAT_S", "30")),
+        "hb_s": HEARTBEAT_S,
     }
 
     # The supervisor splits max_inflight per leg (each leg advertises its SHARE,
