@@ -547,3 +547,56 @@ def test_the_ridden_out_stall_is_logged_at_most_once_a_note_interval(capsys):
     notes = [ln for ln in capsys.readouterr().out.splitlines()
              if "staying up" in ln]
     assert 2 <= len(notes) <= 8      # paced, not silenced
+
+
+SECRET = "CONFIDENTIAL-BUYER-PARAGRAPH-7731"  # no quotes: repr() would escape them
+
+
+def test_a_lone_surrogate_no_longer_fails_the_request():
+    """httpx's `json=` raised UnicodeEncodeError on half an emoji, so the buyer
+    got an error. Now the half becomes U+FFFD and a whole emoji is untouched."""
+    body = {"messages": [{"role": "user", "content": "hi \ud83d and \U0001f600"}]}
+    out = json.loads(tm._json_body(body).decode("utf-8"))
+    assert out["messages"][0]["content"] == "hi � and \U0001f600"
+
+
+def test_a_clean_body_is_sent_byte_for_byte_as_utf8():
+    body = {"messages": [{"role": "user", "content": "héllo 世界"}], "max_tokens": 8}
+    assert json.loads(tm._json_body(body)) == body
+
+
+def test_a_unicode_error_is_logged_without_the_request():
+    """repr() of a UnicodeEncodeError carries the whole string it failed on,
+    which was the buyer's JSON body: tens of KB of prompt in the miner log."""
+    payload = json.dumps({"messages": [{"role": "user",
+                                        "content": SECRET * 1000 + "\ud83d"}]},
+                         ensure_ascii=False)
+    try:
+        payload.encode("utf-8")
+    except UnicodeEncodeError as e:
+        err = e
+    line = tm._log_safe_error(err)
+    assert SECRET not in line and '"role"' not in line
+    assert line.startswith("UnicodeEncodeError") and len(line) < 200
+
+
+def test_an_engine_validation_error_is_logged_without_the_echoed_input():
+    e = tm.ServeError(422, '{"detail":[{"type":"string_type","loc":["body",'
+                           '"messages",0,"content"],"msg":"Input should be a '
+                           'valid string","input":"' + SECRET + '"}]}')
+    line = tm._log_safe_error(e)
+    assert SECRET not in line and "status=422" in line
+
+
+def test_serve_one_never_prints_the_request_on_failure(capsys):
+    class Unencodable:
+        async def stream(self, request):
+            json.dumps(request, ensure_ascii=False).encode("utf-8")
+            yield  # pragma: no cover
+
+    frame = {"corr_id": "c1", "request": {"messages": [
+        {"role": "user", "content": SECRET + "\ud83d"}]}}
+    asyncio.run(tm._serve_one(FakeWS(), frame, Unencodable(), tm.Load()))
+    out = capsys.readouterr().out
+    assert "serve error: UnicodeEncodeError" in out
+    assert SECRET not in out
