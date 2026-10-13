@@ -54,6 +54,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -435,6 +436,40 @@ def _raise_with_body(r) -> None:
     except Exception:
         detail = ""
     raise ServeError(_client_facing_status(r.status_code, detail), detail[:1000])
+
+
+_LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")
+_JSON_HEADERS = {"Content-Type": "application/json"}
+
+
+def _json_body(obj) -> bytes:
+    """Encode a request body for the local serve.
+
+    httpx's `json=` encodes UTF-8 strictly, so one lone surrogate (half an emoji
+    from a buggy client) raised UnicodeEncodeError and the request failed. The
+    engine's tokenizer rejects lone surrogates too, so they become U+FFFD, the
+    way most APIs treat malformed text, and the request goes through."""
+    text = json.dumps(obj, ensure_ascii=False, separators=(",", ":"),
+                      allow_nan=False)
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError:
+        return _LONE_SURROGATE.sub("\ufffd", text).encode("utf-8")
+
+
+def _log_safe_error(e: BaseException, limit: int = 160) -> str:
+    """One line about a serve error that is safe to write to the miner log.
+
+    Never the request. `repr()` of a UnicodeError carries the whole string it
+    failed on, which here was the buyer's JSON body (tens of KB of messages),
+    and an engine validation error can echo the offending input after
+    `"input"`. Keep the type, the status and the head of the message."""
+    if isinstance(e, UnicodeError):
+        return (f"{type(e).__name__}: {getattr(e, 'reason', '')} "
+                f"at position {getattr(e, 'start', '?')}")
+    msg = " ".join(str(e).split()).split('"input"')[0][:limit]
+    status = getattr(e, "status", None)
+    return f"{type(e).__name__}{f' status={status}' if status else ''}: {msg}"
 
 
 def _merge_tool_calls(acc: list, deltas: list) -> list:
@@ -874,7 +909,8 @@ class Serve:
             async with httpx.AsyncClient(timeout=timeout) as c:
                 if is_span_scoring(request):
                     r = await c.post(self._root(url) + "/generate",
-                                     json=self._generate_body(request))
+                                     content=_json_body(self._generate_body(request)),
+                                     headers=_JSON_HEADERS)
                     _raise_with_body(r)
                     j = r.json()
                     meta = j.get("meta_info") or {}
@@ -900,7 +936,8 @@ class Serve:
                                             finish, _span_logprobs(meta))
 
                 r = await c.post(self._v1(url) + "/completions",
-                                 json=self._text_body(request))
+                                 content=_json_body(self._text_body(request)),
+                                 headers=_JSON_HEADERS)
                 _raise_with_body(r)
                 j = r.json()
             choice = (j.get("choices") or [{}])[0]
@@ -926,7 +963,8 @@ class Serve:
         try:
             async with httpx.AsyncClient(timeout=timeout) as c:
                 async with c.stream("POST", self._v1(url) + "/chat/completions",
-                                    json=body) as r:
+                                    content=_json_body(body),
+                                    headers=_JSON_HEADERS) as r:
                     if r.status_code >= 400:
                         detail = (await r.aread()).decode("utf-8", "replace")
                         raise ServeError(
@@ -1023,7 +1061,7 @@ async def _serve_one(ws, frame, backend: Serve, load: Load):
                                       "status": getattr(e, "status", None)})))
         except Exception:
             pass
-        print(f"[tee_miner] serve error: {e!r}", flush=True)
+        print(f"[tee_miner] serve error: {_log_safe_error(e)}", flush=True)
     finally:
         # MUST be in `finally`: a slot leaked on the error path would shrink the
         # advertised capacity permanently, and the count only ever drifts one
