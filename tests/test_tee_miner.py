@@ -715,7 +715,7 @@ def test_worker_count_falls_through_to_a_door_that_answers(monkeypatch):
     assert tm._fetch_worker_count(LB) is None       # one door, unreachable
 
 
-def _run_leg(monkeypatch, connect, dials=6):
+def _run_leg(monkeypatch, connect, dials=6, spec=f"{LB},{CF}"):
     """Drive one leg through `dials` dial attempts and return the URLs it used."""
     urls = []
 
@@ -734,7 +734,7 @@ def _run_leg(monkeypatch, connect, dials=6):
     monkeypatch.setattr(tm.websockets, "connect", fake_connect)
     monkeypatch.setattr(tm.asyncio, "sleep", no_sleep)
     monkeypatch.setattr(tm, "_session", session)
-    doors = tm.Doors.parse(f"{LB},{CF}", seed="w1")
+    doors = tm.Doors.parse(spec, seed="w1")
     leg = doors.homes(8).index(LB)
     cfg = {"doors": doors}
     try:
@@ -769,3 +769,68 @@ def test_sessions_the_edge_cuts_do_not_move_a_leg_off_its_door(monkeypatch):
 
     doors, leg = _run_leg(monkeypatch, connect)
     assert doors == [LB] * 6
+
+
+# ------------------------------------------------------------- backup doors
+def test_the_default_puts_every_leg_on_the_lb_and_keeps_cloudflare_spare():
+    doors = tm.Doors.parse(tm.DEFAULT_GW, seed="w1")
+    assert doors.homes(8) == ["wss://lb.engy.ai/gw"] * 8
+    assert doors.backups == ["wss://api.engy.ai/gw"]
+
+
+def test_a_backup_carries_no_legs_while_the_primary_opens():
+    doors = tm.Doors.parse(f"{LB}|{CF}", seed="w1", clock=DoorClock())
+    assert doors.homes(8) == [LB] * 8
+    assert doors.pick(LB) == LB
+
+
+def test_legs_use_the_backup_only_while_the_primary_is_benched():
+    clock = DoorClock()
+    doors = tm.Doors.parse(f"{LB}|{CF}", clock=clock)
+    doors.failed(LB), doors.failed(LB)
+    assert doors.pick(LB) == CF
+    clock.t += tm._DOOR_BENCH_S
+    assert doors.pick(LB) == LB          # back on the LB at the next dial
+
+
+def test_a_second_primary_is_tried_before_the_backup():
+    other = "wss://lb2.example/gw"
+    doors = tm.Doors.parse(f"{LB},{other}|{CF}", clock=DoorClock())
+    doors.failed(LB), doors.failed(LB)
+    assert doors.pick(LB) == other
+    doors.failed(other), doors.failed(other)
+    assert doors.pick(LB) == CF
+
+
+def test_failures_landing_after_the_bench_do_not_lengthen_it():
+    """Eight legs dial at once; the two that bench the door are followed by six
+    more failures from the same outage. Counting them would double the bench
+    three times over before a single retry."""
+    clock = DoorClock()
+    doors = tm.Doors.parse(f"{LB}|{CF}", clock=clock)
+    for _ in range(8):
+        doors.failed(LB)
+    assert doors._until[LB] - clock.t == tm._DOOR_BENCH_S
+
+
+def test_meta_asks_the_primary_first_and_the_backup_while_it_is_benched():
+    doors = tm.Doors.parse(f"{LB}|{CF}", clock=DoorClock())
+    assert doors.by_preference() == [LB, CF]
+    doors.failed(LB), doors.failed(LB)
+    assert doors.by_preference() == [CF, LB]
+
+
+def test_a_backup_with_no_primary_is_just_the_door():
+    doors = tm.Doors.parse(f"|{CF}")
+    assert doors.homes(8) == [CF] * 8 and doors.backups == []
+
+
+def test_a_leg_falls_back_to_the_backup_when_the_lb_will_not_open(monkeypatch):
+    async def connect(url):
+        if "lb.example" in url:
+            raise OSError("cannot resolve")
+        return OpenWS()
+
+    doors, _ = _run_leg(monkeypatch, connect, spec=f"{LB}|{CF}")
+    assert doors[:2] == [LB, LB]
+    assert set(doors[2:]) == {CF}

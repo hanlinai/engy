@@ -26,13 +26,13 @@ Identity, read from the environment automatically:
 
 Configuration:
 
-  ENGY_GW_URL          gateway websocket base, or several comma-separated
-                       doors to spread the legs across (default
-                       wss://lb.engy.ai/gw,wss://api.engy.ai/gw). Each door
-                       carries an equal share of the legs, so one door's
-                       outage costs that share instead of every leg; repeat a
-                       door to weight it. A door that cannot be reached is
-                       benched and its legs dial the others meanwhile.
+  ENGY_GW_URL          gateway doors, `primary[,primary..][|backup[,backup..]]`
+                       (default wss://lb.engy.ai/gw|wss://api.engy.ai/gw).
+                       Legs live on the primaries, spread evenly when there are
+                       several. A backup carries nothing until a primary fails
+                       to open twice in a row; then that primary is benched and
+                       its legs dial the backup meanwhile. A single URL behaves
+                       as it always has.
   ENGY_MODEL           model name to advertise  (default glm-5.2)
   ENGY_SERVE_URL       local serve base url, comma-separated for several
                                                 (default http://127.0.0.1:8000)
@@ -1214,7 +1214,8 @@ def _close_note(ws) -> str:
     return f"{note} {reason!r}" if reason else note
 
 
-DEFAULT_GW = "wss://lb.engy.ai/gw,wss://api.engy.ai/gw"
+# Every leg through the load balancer; Cloudflare only while it will not open.
+DEFAULT_GW = "wss://lb.engy.ai/gw|wss://api.engy.ai/gw"
 # A door that fails to OPEN this many times in a row is benched...
 _DOOR_OPEN_FAILS = 2
 # ...for this long, doubling on each bench up to the cap, so a door that is
@@ -1227,32 +1228,42 @@ def _host(url: str) -> str:
     return url.split("://", 1)[-1].split("/", 1)[0]
 
 
+def _clean(urls) -> list[str]:
+    return [u.strip().rstrip("/") for u in urls if u and u.strip()]
+
+
 class Doors:
     """The gateway doors this worker dials, and which of them are failing.
 
-    Every door reaches the same gateway, but each runs through its own edge,
-    and an edge can drop the connections it carries: the Google load balancer
-    now and then closes a handful of sessions at once on its own side, and a
-    Cloudflare wave can take every leg it holds. With all legs on one door,
-    that door's bad minute is the whole worker's bad minute.
+    The spec is `primary[,primary...][|backup[,backup...]]`. Every door reaches
+    the same gateway through its own edge.
 
-    So the legs are spread. Each door gets an equal share of slots (a door
-    listed twice gets twice the share), and the slots are shuffled with a seed
-    taken from this worker's id: the shuffle is stable across restarts, and it
-    differs between workers, so every gateway process receives legs through
-    every door rather than leg 0 always arriving through the first one.
+    Legs live on the primaries. With one primary that is every leg; with
+    several, each gets an equal share of slots (a door listed twice gets twice
+    the share), shuffled with a seed from this worker's id: stable across
+    restarts, different between workers, so every gateway process receives
+    legs through every primary.
 
-    A door that fails to open _DOOR_OPEN_FAILS times in a row is benched, and
-    legs whose home it is dial the next door until the bench runs out (on some
-    mainland China networks lb.engy.ai does not resolve at all). Only a failed
-    OPEN counts. A session that opened and was later cut is the edge doing what
-    it does, and is no reason to leave the door."""
+    Backups carry nothing while a primary opens. A door that fails to open
+    _DOOR_OPEN_FAILS times in a row is benched, and its legs dial the next
+    primary, then the backups, until the bench runs out. They go home on their
+    next dial after that; a live leg is never torn down to move it. This is the
+    way out for networks that cannot reach the primary at all (on some
+    mainland China networks lb.engy.ai does not resolve).
 
-    def __init__(self, urls, seed: str = "", clock=time.monotonic):
-        self.slots = [u.strip().rstrip("/") for u in urls if u and u.strip()]
+    Only a failed OPEN counts against a door. A session that opened and was
+    later cut is the edge doing what it does, and is no reason to leave it."""
+
+    def __init__(self, urls, seed: str = "", clock=time.monotonic, backups=()):
+        self.slots = _clean(urls)
+        backups = [u for u in _clean(backups) if u not in self.slots]
+        if not self.slots:                  # "|x": a backup with no primary
+            self.slots, backups = backups, []
         if not self.slots:
             raise ValueError("no gateway door configured")
-        self.urls = list(dict.fromkeys(self.slots))     # distinct, in order
+        self.primaries = list(dict.fromkeys(self.slots))   # distinct, in order
+        self.backups = list(dict.fromkeys(backups))
+        self.urls = self.primaries + self.backups
         self._seed = seed
         self._clock = clock
         self._fails = dict.fromkeys(self.urls, 0)
@@ -1261,10 +1272,11 @@ class Doors:
 
     @classmethod
     def parse(cls, spec: str, seed: str = "", clock=time.monotonic):
-        return cls(spec.split(","), seed, clock)
+        primary, _, backup = spec.partition("|")
+        return cls(primary.split(","), seed, clock, backup.split(","))
 
     def homes(self, n: int) -> list[str]:
-        """Leg i's home door, for an n-leg dial."""
+        """Leg i's home door, for an n-leg dial. Always a primary."""
         k = len(self.slots)
         slots = [self.slots[j % k] for j in range(n)]
         random.Random(f"{self._seed}:{n}").shuffle(slots)
@@ -1275,9 +1287,10 @@ class Doors:
 
     def pick(self, home: str) -> str:
         """The door a leg should dial now: its home unless the home is benched,
-        then the next door after it. All benched: the one back soonest."""
-        i = self.urls.index(home)
-        order = self.urls[i:] + self.urls[:i]
+        then the primaries after it, then the backups. All benched: the one
+        back soonest."""
+        i = self.primaries.index(home)
+        order = self.primaries[i:] + self.primaries[:i] + self.backups
         for u in order:
             if not self.benched(u):
                 return u
@@ -1288,6 +1301,10 @@ class Doors:
         self._bench[url] = _DOOR_BENCH_S
 
     def failed(self, url: str):
+        if self.benched(url):
+            # Legs that dialed before the bench landed are still failing in.
+            # They are the same outage, not a reason to bench it for longer.
+            return
         self._fails[url] += 1
         if self._fails[url] < _DOOR_OPEN_FAILS:
             return
@@ -1300,7 +1317,8 @@ class Doors:
               "dial the other doors meanwhile", flush=True)
 
     def by_preference(self) -> list[str]:
-        """Doors for a one-shot request like /gw/meta: open ones first."""
+        """Doors for a one-shot request like /gw/meta: open ones first,
+        primaries before backups."""
         return sorted(self.urls, key=lambda u: (self.benched(u),
                                                 self.urls.index(u)))
 
@@ -1574,8 +1592,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(
         description="engy tee_miner (gateway leg for a TEE-attested worker)")
     p.add_argument("--gw", default=_env("ENGY_GW_URL", DEFAULT_GW),
-                   help="gateway websocket base, or several comma-separated "
-                        "doors to spread the legs across")
+                   help="gateway doors: primary[,primary..][|backup[,..]]")
     p.add_argument("--model", default=_env("ENGY_MODEL", "glm-5.2"))
     p.add_argument("--miner-key", "--miner_key", dest="miner_key", default=None,
                    help="default $ENGY_MINER_KEY, injected on a TEE worker")
