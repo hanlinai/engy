@@ -600,3 +600,172 @@ def test_serve_one_never_prints_the_request_on_failure(capsys):
     out = capsys.readouterr().out
     assert "serve error: UnicodeEncodeError" in out
     assert SECRET not in out
+
+
+# ------------------------------------------------------------- gateway doors
+LB, CF = "wss://lb.example/gw", "wss://cf.example/gw"
+
+
+class DoorClock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+def test_each_door_carries_an_equal_share_of_the_legs():
+    homes = tm.Doors.parse(f"{LB},{CF}", seed="w1").homes(8)
+    assert sorted(homes) == [CF] * 4 + [LB] * 4
+
+
+def test_a_door_listed_twice_carries_twice_the_share():
+    homes = tm.Doors.parse(f"{LB},{LB},{LB},{CF}", seed="w1").homes(8)
+    assert homes.count(LB) == 6 and homes.count(CF) == 2
+
+
+def test_the_shuffle_is_stable_for_a_worker_and_differs_between_workers():
+    """Stable, so a restart puts the legs back on the same doors. Different, so
+    across the fleet every gateway process gets legs through every door,
+    instead of leg 0 always arriving through the first one listed."""
+    spec = f"{LB},{CF}"
+    assert tm.Doors.parse(spec, "w1").homes(8) == tm.Doors.parse(spec, "w1").homes(8)
+    plans = [tm.Doors.parse(spec, f"w{k}").homes(8) for k in range(40)]
+    for leg in range(8):
+        assert {plan[leg] for plan in plans} == {LB, CF}
+
+
+def test_one_door_keeps_the_old_single_url_behaviour():
+    doors = tm.Doors.parse(LB + "/")
+    assert doors.homes(8) == [LB] * 8
+    assert doors.pick(LB) == LB
+
+
+def test_two_failed_opens_bench_a_door_and_its_legs_move_over():
+    clock = DoorClock()
+    doors = tm.Doors.parse(f"{LB},{CF}", clock=clock)
+    doors.failed(LB)
+    assert doors.pick(LB) == LB          # one miss is not enough
+    doors.failed(LB)
+    assert doors.pick(LB) == CF          # benched: the leg dials the other door
+    assert doors.pick(CF) == CF          # legs already home on CF are unmoved
+    clock.t += tm._DOOR_BENCH_S
+    assert doors.pick(LB) == LB          # bench over: back home on the next dial
+
+
+def test_an_open_clears_the_strikes_against_a_door():
+    doors = tm.Doors.parse(f"{LB},{CF}", clock=DoorClock())
+    doors.failed(LB)
+    doors.opened(LB)
+    doors.failed(LB)
+    assert doors.pick(LB) == LB
+
+
+def test_a_door_that_stays_down_is_benched_longer_each_time():
+    clock = DoorClock()
+    doors = tm.Doors.parse(f"{LB},{CF}", clock=clock)
+    benches = []
+    for _ in range(7):
+        doors.failed(LB)
+        doors.failed(LB)
+        benches.append(doors._until[LB] - clock.t)
+        clock.t = doors._until[LB]
+    assert benches[:3] == [tm._DOOR_BENCH_S, 2 * tm._DOOR_BENCH_S,
+                           4 * tm._DOOR_BENCH_S]
+    assert max(benches) == tm._DOOR_BENCH_MAX_S
+
+
+def test_with_every_door_benched_the_leg_dials_the_one_back_soonest():
+    clock = DoorClock()
+    doors = tm.Doors.parse(f"{LB},{CF}", clock=clock)
+    doors.failed(CF), doors.failed(CF)
+    clock.t += 10
+    doors.failed(LB), doors.failed(LB)
+    assert doors.pick(LB) == CF
+
+
+def test_meta_asks_open_doors_first():
+    clock = DoorClock()
+    doors = tm.Doors.parse(f"{LB},{CF}", clock=clock)
+    assert doors.by_preference() == [LB, CF]
+    doors.failed(LB), doors.failed(LB)
+    assert doors.by_preference() == [CF, LB]
+
+
+def test_worker_count_falls_through_to_a_door_that_answers(monkeypatch):
+    asked = []
+
+    class R:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"workers": 8}
+
+    def get(url, timeout):
+        asked.append(url)
+        if "lb.example" in url:
+            raise OSError("no route")
+        return R()
+
+    monkeypatch.delenv("ENGY_GW_WORKERS", raising=False)
+    monkeypatch.setattr(tm.httpx, "get", get)
+    assert tm._fetch_worker_count([LB, CF]) == 8
+    assert asked == ["https://lb.example/gw/meta", "https://cf.example/gw/meta"]
+    assert tm._fetch_worker_count(LB) is None       # one door, unreachable
+
+
+def _run_leg(monkeypatch, connect, dials=6):
+    """Drive one leg through `dials` dial attempts and return the URLs it used."""
+    urls = []
+
+    async def fake_connect(url, **kw):
+        urls.append(url)
+        if len(urls) > dials:
+            raise asyncio.CancelledError
+        return await connect(url)
+
+    async def no_sleep(_):
+        pass
+
+    async def session(ws, cfg, cap, load, tag):
+        raise ConnectionResetError("cut by the edge")
+
+    monkeypatch.setattr(tm.websockets, "connect", fake_connect)
+    monkeypatch.setattr(tm.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(tm, "_session", session)
+    doors = tm.Doors.parse(f"{LB},{CF}", seed="w1")
+    leg = doors.homes(8).index(LB)
+    cfg = {"doors": doors}
+    try:
+        asyncio.run(tm._leg(leg, 8, cfg, {}, tm.Load()))
+    except asyncio.CancelledError:
+        pass
+    return [u.rsplit("/", 1)[0] for u in urls[:dials]], leg
+
+
+class OpenWS:
+    close_code = 1006
+    close_reason = ""
+
+    async def close(self):
+        pass
+
+
+def test_a_leg_whose_door_will_not_open_moves_to_the_other_door(monkeypatch):
+    async def connect(url):
+        if "lb.example" in url:
+            raise OSError("timed out during opening handshake")
+        return OpenWS()
+
+    doors, _ = _run_leg(monkeypatch, connect)
+    assert doors[:2] == [LB, LB]
+    assert set(doors[2:]) == {CF}
+
+
+def test_sessions_the_edge_cuts_do_not_move_a_leg_off_its_door(monkeypatch):
+    async def connect(url):
+        return OpenWS()
+
+    doors, leg = _run_leg(monkeypatch, connect)
+    assert doors == [LB] * 6
