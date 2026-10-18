@@ -27,12 +27,13 @@ Identity, read from the environment automatically:
 Configuration:
 
   ENGY_GW_URL          gateway doors, `primary[,primary..][|backup[,backup..]]`
-                       (default wss://lb.engy.ai/gw|wss://api.engy.ai/gw).
+                       (default wss://lb.engy.ai/gw,wss://api.engy.ai/gw: half
+                       the legs on each, in an order shuffled per worker).
                        Legs live on the primaries, spread evenly when there are
-                       several. A backup carries nothing until a primary fails
-                       to open twice in a row; then that primary is benched and
-                       its legs dial the backup meanwhile. A single URL behaves
-                       as it always has.
+                       several. A door that fails to open twice in a row is
+                       benched and its legs dial the next primary, then any
+                       backup, meanwhile. A backup carries nothing until then.
+                       A single URL behaves as it always has.
   ENGY_MODEL           model name to advertise  (default glm-5.2)
   ENGY_SERVE_URL       local serve base url, comma-separated for several
                                                 (default http://127.0.0.1:8000)
@@ -1214,8 +1215,11 @@ def _close_note(ws) -> str:
     return f"{note} {reason!r}" if reason else note
 
 
-# Every leg through the load balancer; Cloudflare only while it will not open.
-DEFAULT_GW = "wss://lb.engy.ai/gw|wss://api.engy.ai/gw"
+# Half the legs through the load balancer, half through Cloudflare, in an order
+# shuffled per worker: a stall on one edge cuts at most half of a worker's legs,
+# and a different half on each worker. A door that will not open hands its legs
+# to the other one until its bench runs out.
+DEFAULT_GW = "wss://lb.engy.ai/gw,wss://api.engy.ai/gw"
 # A door that fails to OPEN this many times in a row is benched...
 _DOOR_OPEN_FAILS = 2
 # ...for this long, doubling on each bench up to the cap, so a door that is

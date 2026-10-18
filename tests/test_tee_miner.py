@@ -771,11 +771,25 @@ def test_sessions_the_edge_cuts_do_not_move_a_leg_off_its_door(monkeypatch):
     assert doors == [LB] * 6
 
 
+# ------------------------------------------------------------- default doors
+def test_the_default_splits_legs_half_lb_half_cloudflare_shuffled_per_worker():
+    lb, cf = "wss://lb.engy.ai/gw", "wss://api.engy.ai/gw"
+    homes = {w: tm.Doors.parse(tm.DEFAULT_GW, seed=w).homes(8) for w in ("w1", "w2", "w3", "w4")}
+    for h in homes.values():
+        assert h.count(lb) == 4 and h.count(cf) == 4
+    assert len({tuple(h) for h in homes.values()}) > 1           # order differs across workers
+    assert tm.Doors.parse(tm.DEFAULT_GW, seed="w1").homes(8) == homes["w1"]  # stable per worker
+    assert tm.Doors.parse(tm.DEFAULT_GW, seed="w1").backups == []
+
+
+def test_the_default_moves_a_dead_doors_legs_to_the_other_door():
+    lb, cf = "wss://lb.engy.ai/gw", "wss://api.engy.ai/gw"
+    doors = tm.Doors.parse(tm.DEFAULT_GW, seed="w1", clock=DoorClock())
+    doors.failed(lb), doors.failed(lb)
+    assert doors.pick(lb) == cf and doors.pick(cf) == cf
+
+
 # ------------------------------------------------------------- backup doors
-def test_the_default_puts_every_leg_on_the_lb_and_keeps_cloudflare_spare():
-    doors = tm.Doors.parse(tm.DEFAULT_GW, seed="w1")
-    assert doors.homes(8) == ["wss://lb.engy.ai/gw"] * 8
-    assert doors.backups == ["wss://api.engy.ai/gw"]
 
 
 def test_a_backup_carries_no_legs_while_the_primary_opens():
