@@ -26,9 +26,14 @@ Identity, read from the environment automatically:
 
 Configuration:
 
-  ENGY_GW_URL          gateway websocket base   (default wss://api.engy.ai/gw;
-                       recommended wss://lb.engy.ai/gw, the dedicated miner
-                       endpoint, where your network can reach it)
+  ENGY_GW_URL          gateway doors, `primary[,primary..][|backup[,backup..]]`
+                       (default wss://lb.engy.ai/gw,wss://api.engy.ai/gw: half
+                       the legs on each, in an order shuffled per worker).
+                       Legs live on the primaries, spread evenly when there are
+                       several. A door that fails to open twice in a row is
+                       benched and its legs dial the next primary, then any
+                       backup, meanwhile. A backup carries nothing until then.
+                       A single URL behaves as it always has.
   ENGY_MODEL           model name to advertise  (default glm-5.2)
   ENGY_SERVE_URL       local serve base url, comma-separated for several
                                                 (default http://127.0.0.1:8000)
@@ -54,6 +59,7 @@ import glob
 import hashlib
 import json
 import os
+import random
 import re
 import socket
 import subprocess
@@ -1209,10 +1215,125 @@ def _close_note(ws) -> str:
     return f"{note} {reason!r}" if reason else note
 
 
+# Half the legs through the load balancer, half through Cloudflare, in an order
+# shuffled per worker: a stall on one edge cuts at most half of a worker's legs,
+# and a different half on each worker. A door that will not open hands its legs
+# to the other one until its bench runs out.
+DEFAULT_GW = "wss://lb.engy.ai/gw,wss://api.engy.ai/gw"
+# A door that fails to OPEN this many times in a row is benched...
+_DOOR_OPEN_FAILS = 2
+# ...for this long, doubling on each bench up to the cap, so a door that is
+# down for hours is retried a few times an hour rather than on every re-dial.
+_DOOR_BENCH_S = 60.0
+_DOOR_BENCH_MAX_S = 900.0
+
+
+def _host(url: str) -> str:
+    return url.split("://", 1)[-1].split("/", 1)[0]
+
+
+def _clean(urls) -> list[str]:
+    return [u.strip().rstrip("/") for u in urls if u and u.strip()]
+
+
+class Doors:
+    """The gateway doors this worker dials, and which of them are failing.
+
+    The spec is `primary[,primary...][|backup[,backup...]]`. Every door reaches
+    the same gateway through its own edge.
+
+    Legs live on the primaries. With one primary that is every leg; with
+    several, each gets an equal share of slots (a door listed twice gets twice
+    the share), shuffled with a seed from this worker's id: stable across
+    restarts, different between workers, so every gateway process receives
+    legs through every primary.
+
+    Backups carry nothing while a primary opens. A door that fails to open
+    _DOOR_OPEN_FAILS times in a row is benched, and its legs dial the next
+    primary, then the backups, until the bench runs out. They go home on their
+    next dial after that; a live leg is never torn down to move it. This is the
+    way out for networks that cannot reach the primary at all (on some
+    mainland China networks lb.engy.ai does not resolve).
+
+    Only a failed OPEN counts against a door. A session that opened and was
+    later cut is the edge doing what it does, and is no reason to leave it."""
+
+    def __init__(self, urls, seed: str = "", clock=time.monotonic, backups=()):
+        self.slots = _clean(urls)
+        backups = [u for u in _clean(backups) if u not in self.slots]
+        if not self.slots:                  # "|x": a backup with no primary
+            self.slots, backups = backups, []
+        if not self.slots:
+            raise ValueError("no gateway door configured")
+        self.primaries = list(dict.fromkeys(self.slots))   # distinct, in order
+        self.backups = list(dict.fromkeys(backups))
+        self.urls = self.primaries + self.backups
+        self._seed = seed
+        self._clock = clock
+        self._fails = dict.fromkeys(self.urls, 0)
+        self._until = dict.fromkeys(self.urls, 0.0)
+        self._bench = dict.fromkeys(self.urls, _DOOR_BENCH_S)
+
+    @classmethod
+    def parse(cls, spec: str, seed: str = "", clock=time.monotonic):
+        primary, _, backup = spec.partition("|")
+        return cls(primary.split(","), seed, clock, backup.split(","))
+
+    def homes(self, n: int) -> list[str]:
+        """Leg i's home door, for an n-leg dial. Always a primary."""
+        k = len(self.slots)
+        slots = [self.slots[j % k] for j in range(n)]
+        random.Random(f"{self._seed}:{n}").shuffle(slots)
+        return slots
+
+    def benched(self, url: str) -> bool:
+        return self._clock() < self._until[url]
+
+    def pick(self, home: str) -> str:
+        """The door a leg should dial now: its home unless the home is benched,
+        then the primaries after it, then the backups. All benched: the one
+        back soonest."""
+        i = self.primaries.index(home)
+        order = self.primaries[i:] + self.primaries[:i] + self.backups
+        for u in order:
+            if not self.benched(u):
+                return u
+        return min(order, key=lambda u: self._until[u])
+
+    def opened(self, url: str):
+        self._fails[url] = 0
+        self._bench[url] = _DOOR_BENCH_S
+
+    def failed(self, url: str):
+        if self.benched(url):
+            # Legs that dialed before the bench landed are still failing in.
+            # They are the same outage, not a reason to bench it for longer.
+            return
+        self._fails[url] += 1
+        if self._fails[url] < _DOOR_OPEN_FAILS:
+            return
+        bench = self._bench[url]
+        self._until[url] = self._clock() + bench
+        self._bench[url] = min(bench * 2, _DOOR_BENCH_MAX_S)
+        self._fails[url] = 0
+        print(f"[tee_miner] door {_host(url)} failed to open "
+              f"{_DOOR_OPEN_FAILS}x in a row; benched {bench:.0f}s, its legs "
+              "dial the other doors meanwhile", flush=True)
+
+    def by_preference(self) -> list[str]:
+        """Doors for a one-shot request like /gw/meta: open ones first,
+        primaries before backups."""
+        return sorted(self.urls, key=lambda u: (self.benched(u),
+                                                self.urls.index(u)))
+
+
 async def _leg(i: int, n: int, cfg, cap, load: Load):
-    url = cfg["gw"] if n <= 1 else f"{cfg['gw']}/{i}"
-    tag = f"gw{i}"
+    doors: Doors = cfg["doors"]
+    home = doors.homes(n)[i]
     while True:
+        door = doors.pick(home)
+        url = door if n <= 1 else f"{door}/{i}"
+        tag = f"gw{i}@{_host(door)}"
         ws = None
         try:
             ws = await websockets.connect(
@@ -1224,6 +1345,7 @@ async def _leg(i: int, n: int, cfg, cap, load: Load):
                 # session, so the gateway books the worker as timed out and
                 # answers 504 for a request the serve never even received.
                 max_size=64 * 1024 * 1024)
+            doors.opened(door)
             drained = await _session(ws, cfg, cap, load, tag)
             if drained:
                 # _retire owns the socket now. Re-dial immediately so the
@@ -1239,7 +1361,9 @@ async def _leg(i: int, n: int, cfg, cap, load: Load):
             print(f"[tee_miner] {tag} session ended; {_close_note(ws)}; "
                   f"reconnecting", flush=True)
         except Exception as e:
-            if ws is not None:
+            if ws is None:              # never opened: a mark against the door
+                doors.failed(door)
+            else:
                 try:
                     await ws.close()
                 except Exception:
@@ -1260,9 +1384,12 @@ def _split_capacity(capacity: dict, n: int) -> dict:
     return cap
 
 
-def _fetch_worker_count(gw: str) -> int | None:
+def _fetch_worker_count(gws) -> int | None:
     """One leg per gateway worker process, so we receive all buyer traffic; a
     single-dial miner only ever lands on worker 0.
+
+    `gws` is one door or several; they reach the same gateway, so the first
+    that answers decides.
 
     Returns None (not 1) when /gw/meta is unreachable, so the supervisor KEEPS
     the current count on a transient failure instead of collapsing a live
@@ -1273,13 +1400,15 @@ def _fetch_worker_count(gw: str) -> int | None:
     n = _env("ENGY_GW_WORKERS")
     if n:
         return max(1, int(n))
-    try:
-        meta = gw.replace("wss://", "https://").replace("ws://", "http://") + "/meta"
-        r = httpx.get(meta, timeout=5.0)
-        r.raise_for_status()
-        return max(1, min(int((r.json() or {}).get("workers") or 1), 64))
-    except Exception:
-        return None
+    for gw in ([gws] if isinstance(gws, str) else gws):
+        try:
+            meta = gw.replace("wss://", "https://").replace("ws://", "http://") + "/meta"
+            r = httpx.get(meta, timeout=5.0)
+            r.raise_for_status()
+            return max(1, min(int((r.json() or {}).get("workers") or 1), 64))
+        except Exception:
+            continue
+    return None
 
 
 # How often the supervisor re-reads /gw/meta so a gateway worker-count change
@@ -1415,7 +1544,8 @@ async def _supervise(cfg, capacity: dict, load: Load):
     # capacity, so a wrong first split would stick.
     fetched = None
     for _ in range(3):
-        fetched = await asyncio.to_thread(_fetch_worker_count, cfg["gw"])
+        fetched = await asyncio.to_thread(
+            _fetch_worker_count, cfg["doors"].by_preference())
         if fetched is not None:
             break
         await asyncio.sleep(1.0)
@@ -1442,13 +1572,19 @@ async def _supervise(cfg, capacity: dict, load: Load):
                 for i in [i for i in legs if i >= n]:   # drop removed workers
                     legs[i].cancel()
                     legs.pop(i)
+                if n != cur_n:
+                    homes = cfg["doors"].homes(n)
+                    print("[tee_miner] legs -> doors: " + " ".join(
+                        f"{i}:{_host(h)}" for i, h in enumerate(homes)),
+                        flush=True)
                 if cur_n and n != cur_n:
                     print(f"[tee_miner] worker count {cur_n} -> {n} "
                           f"({'added' if n > cur_n else 'removed'} legs, "
                           "existing kept)", flush=True)
                 cur_n = n
             await asyncio.sleep(META_RECHECK_S)
-            fetched = await asyncio.to_thread(_fetch_worker_count, cfg["gw"])
+            fetched = await asyncio.to_thread(
+                _fetch_worker_count, cfg["doors"].by_preference())
     finally:
         for t in legs.values():
             t.cancel()
@@ -1459,7 +1595,8 @@ async def _supervise(cfg, capacity: dict, load: Load):
 def main(argv=None):
     p = argparse.ArgumentParser(
         description="engy tee_miner (gateway leg for a TEE-attested worker)")
-    p.add_argument("--gw", default=_env("ENGY_GW_URL", "wss://api.engy.ai/gw"))
+    p.add_argument("--gw", default=_env("ENGY_GW_URL", DEFAULT_GW),
+                   help="gateway doors: primary[,primary..][|backup[,..]]")
     p.add_argument("--model", default=_env("ENGY_MODEL", "glm-5.2"))
     p.add_argument("--miner-key", "--miner_key", dest="miner_key", default=None,
                    help="default $ENGY_MINER_KEY, injected on a TEE worker")
@@ -1524,7 +1661,10 @@ def main(argv=None):
     # table. Self-reported values for those keys are ignored, so we omit them.
 
     cfg = {
-        "gw": args.gw.rstrip("/"),
+        "gw": args.gw,
+        # Seeded by worker id: the same legs take the same doors after a
+        # restart, while different workers spread differently.
+        "doors": Doors.parse(args.gw, seed=worker_id),
         "model": args.model,
         "miner_key": miner_key,
         "worker_id": worker_id,
@@ -1541,7 +1681,8 @@ def main(argv=None):
     # gateway this worker can take n times what it can), re-reads the worker
     # count for scale events, and health-gates the legs on the serve's /health.
     load = Load()
-    print(f"[tee_miner] supervising legs of {cfg['gw']} as {cfg['model']} "
+    print(f"[tee_miner] supervising legs via "
+          f"{', '.join(_host(u) for u in cfg['doors'].urls)} as {cfg['model']} "
           f"worker={worker_name} worker_id={worker_id}"
           f"{'' if assigned else ' (MINTED, not provider-assigned)'} "
           f"root={cfg['model_root'][:12]} serves={serve_urls} "
