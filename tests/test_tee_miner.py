@@ -352,6 +352,72 @@ def test_dialect_does_not_disturb_the_rest_of_the_body():
     assert body["tools"] == [1]
     assert body["stream"] is True
     assert body["stream_options"] == {"include_usage": True}
+
+
+# ---- prefix continuation: the keys the gateway's prefill.py sets ----
+
+PREFILL = {"messages": [{"role": "user", "content": "2+3? answer in JSON"},
+                        {"role": "assistant", "content": '{"answer": '}],
+           "continue_final_message": True, "add_generation_prompt": False,
+           "chat_template_kwargs": {"thinking": False},
+           "reasoning_effort": "none"}
+
+
+def test_chat_lane_forwards_the_prefill_keys():
+    # Dropped here, sglang renders the prefix as a closed turn and opens a new
+    # one: kimi-k3 re-answered '{"answer": 5}' instead of continuing with '5}'.
+    for model in ("kimi-k3", "qwen3.8-27b", None):
+        body = _serve(model)._chat_body(PREFILL, stream=True)
+        assert body["continue_final_message"] is True, model
+        # False is a value, not an absence: vLLM needs it on the wire.
+        assert body["add_generation_prompt"] is False, model
+        assert body["messages"][-1] == PREFILL["messages"][-1], model
+
+
+def test_prefill_keys_are_not_invented_for_an_ordinary_request():
+    body = _serve("kimi-k3")._chat_body(
+        {"messages": [{"role": "user", "content": "hi"}]}, stream=True)
+    assert "continue_final_message" not in body
+    assert "add_generation_prompt" not in body
+
+
+def test_text_lane_never_carries_the_prefill_keys():
+    # A raw prompt has no trailing assistant turn to continue.
+    body = _serve("kimi-k3")._text_body({"prompt": "abc", **PREFILL})
+    assert "continue_final_message" not in body
+    assert "add_generation_prompt" not in body
+
+
+def test_prefill_keys_reach_the_serve_on_the_wire(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen.update(json.loads(request.content))
+        sse = (b'data: {"choices":[{"delta":{"content":"5}"},'
+               b'"finish_reason":"stop"}]}\n\n'
+               b'data: {"choices":[],"usage":{"prompt_tokens":42,'
+               b'"completion_tokens":3,"total_tokens":45}}\n\n'
+               b'data: [DONE]\n\n')
+        return tm.httpx.Response(200, content=sse,
+                                 headers={"content-type": "text/event-stream"})
+
+    real = tm.httpx.AsyncClient
+
+    def client(*a, **kw):
+        return real(*a, transport=tm.httpx.MockTransport(handler), **kw)
+
+    monkeypatch.setattr(tm.httpx, "AsyncClient", client)
+
+    async def run():
+        return [x async for x in _serve("kimi-k3").stream(dict(PREFILL))]
+
+    out = asyncio.run(run())
+    assert seen["continue_final_message"] is True
+    assert seen["add_generation_prompt"] is False
+    assert seen["messages"][-1] == {"role": "assistant", "content": '{"answer": '}
+    kind, done = out[-1]
+    assert kind == "done"
+    assert done["choices"][0]["message"]["content"] == "5}"
 # ---- usage: the thinking-token count the gateway translates for buyers ----
 
 # verbatim from a prod qwen3.8-27b serve (m5-27:30001), reasoning_effort=medium

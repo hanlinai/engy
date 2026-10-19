@@ -378,6 +378,17 @@ _PASSTHROUGH = ("temperature", "top_p", "n", "stop", "presence_penalty",
                 "repetition_penalty", "stop_token_ids", "chat_template_kwargs",
                 "reasoning_effort")
 
+# Prefix continuation, in the engine's dialect. The gateway turns a buyer's
+# prefill (Moonshot `partial`, DeepSeek `prefix`, a bare trailing assistant
+# message) into these two keys. sglang reads `continue_final_message`: it drops
+# the trailing assistant turn, renders the generation prompt and appends the
+# prefix tokens, so the model resumes mid-answer. Without it the turn renders
+# as closed history plus a fresh assistant turn, and the model re-answers from
+# scratch: kimi-k3 prefix continuation went 0/10 on every TEE worker
+# (2026-10-19). vLLM additionally wants `add_generation_prompt: false`. Chat
+# lane only: the text lane sends a raw prompt and has no messages to continue.
+_ENGINE_PREFILL = ("continue_final_message", "add_generation_prompt")
+
 # Meaningful only on the raw text-completions lane. `echo` is the one that
 # matters: with echo=true plus logprobs, sglang returns per-token logprobs over
 # the PROMPT tokens, which is the point of the lane.
@@ -842,7 +853,7 @@ class Serve:
                 "messages": msgs}
         if request.get("max_tokens"):
             body["max_tokens"] = request["max_tokens"]
-        for k in _PASSTHROUGH:
+        for k in _PASSTHROUGH + _ENGINE_PREFILL:
             if request.get(k) is not None:
                 body[k] = request[k]
         # Translate the effort AFTER the passthrough copy, so the dialect maps
