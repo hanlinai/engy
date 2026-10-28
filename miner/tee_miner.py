@@ -186,6 +186,39 @@ DRAIN_GRACE_S = float(_env("ENGY_DRAIN_GRACE_S",
 # kept being admitted. 10 s stays inside that TTL with room for a late frame.
 HEARTBEAT_S = float(_env("ENGY_HEARTBEAT_S", "10"))
 
+# Proactive leg rotation. The GCP load balancer in front of the gateway cuts
+# every WebSocket at exactly 24 h, and legs that connect together expire
+# together: after a gateway roll every worker re-legs to gateway process N
+# within seconds of it starting, so 24 h later all of that process's legs die
+# in the same second, and a stream cut by it resumes onto a sibling leg on the
+# same process that dies 2 s later (10-27 7:03-7:36 PM PDT: one wave per
+# process). Each leg therefore retires itself at a random age in
+# [LEG_ROTATE_S, LEG_ROTATE_S + LEG_ROTATE_JITTER_S], well before 24 h and
+# spread so no two legs, and no gateway process, expire together.
+# Retiring never cuts a stream: the leg first waits up to LEG_ROTATE_IDLE_WAIT_S
+# for a moment with nothing in flight on it. If none comes, it answers new
+# SERVEs with a 503 (the gateway retries those on another worker before the
+# first token, and cools this worker on that gateway process only) until its
+# in-flight requests finish, capped at LEG_ROTATE_DRAIN_S, then re-dials.
+# ENGY_LEG_ROTATE_S=0 disables rotation.
+LEG_ROTATE_S = float(_env("ENGY_LEG_ROTATE_S", "72000"))
+LEG_ROTATE_JITTER_S = float(_env("ENGY_LEG_ROTATE_JITTER_S", "7200"))
+LEG_ROTATE_IDLE_WAIT_S = float(_env("ENGY_LEG_ROTATE_IDLE_WAIT_S", "600"))
+LEG_ROTATE_DRAIN_S = float(_env("ENGY_LEG_ROTATE_DRAIN_S", "1800"))
+# Stamped 503: the gateway's _retry_class reads it as 'transient', so the
+# request is retried elsewhere before its first token instead of failing.
+_ROTATING_ERROR = {"status": 503, "type": "WorkerUnavailable",
+                   "message": "worker leg is rotating; retry on another worker"}
+
+
+def leg_lifetime(rng=random) -> float | None:
+    """Age at which a freshly dialed leg retires itself, or None when rotation
+    is disabled. Random per leg, so a worker's legs (and the fleet's legs on
+    one gateway process) spread out instead of expiring in the same second."""
+    if LEG_ROTATE_S <= 0:
+        return None
+    return LEG_ROTATE_S + rng.uniform(0.0, max(0.0, LEG_ROTATE_JITTER_S))
+
 
 # -------------------------------------------------------------------- identity
 def _resolve_miner_key(explicit: str | None) -> str:
@@ -1128,9 +1161,60 @@ async def _retire(ws, hb, serving: dict, load: Load, tag: str,
               + (f" with {left} still in flight" if left else ""), flush=True)
 
 
-async def _session(ws, cfg, cap, load: Load, tag: str) -> bool:
+class _LegRotation:
+    """One leg's self-retirement (see LEG_ROTATE_S). After `after` seconds it
+    waits up to LEG_ROTATE_IDLE_WAIT_S for this leg's in-flight requests to be
+    gone; past that it turns on `bouncing` (_session answers new SERVEs with
+    _ROTATING_ERROR) and waits up to LEG_ROTATE_DRAIN_S for them to finish.
+    Then it marks `rotated` and closes the socket, which ends _session; the leg
+    loop re-dials.
+
+    `bouncing` is turned on BEFORE the final emptiness check, so a SERVE that
+    arrives between the check and the close is handed back, never cut."""
+
+    def __init__(self, ws, serving: dict, after: float, tag: str):
+        self.bouncing = False
+        self.rotated = False
+        self.task = asyncio.create_task(self._run(ws, serving, after, tag))
+
+    @staticmethod
+    async def _until_empty(serving: dict, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while serving:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            await asyncio.wait(set(serving.values()), timeout=left,
+                               return_when=asyncio.FIRST_COMPLETED)
+        return True
+
+    async def _run(self, ws, serving: dict, after: float, tag: str) -> None:
+        await asyncio.sleep(after)
+        idle = await self._until_empty(serving, LEG_ROTATE_IDLE_WAIT_S)
+        self.bouncing = True
+        if not idle:
+            print(f"[tee_miner] {tag} rotating after {after / 3600:.1f}h; no idle "
+                  f"moment in {LEG_ROTATE_IDLE_WAIT_S:.0f}s, handing new requests "
+                  f"back while {len(serving)} finish", flush=True)
+        if not await self._until_empty(serving, LEG_ROTATE_DRAIN_S):
+            print(f"[tee_miner] {tag} rotation drain cap {LEG_ROTATE_DRAIN_S:.0f}s "
+                  f"reached with {len(serving)} still in flight; rotating anyway",
+                  flush=True)
+        self.rotated = True
+        print(f"[tee_miner] {tag} leg rotated after {after / 3600:.1f}h "
+              f"({'idle' if idle else 'drained'}); re-dialing", flush=True)
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+async def _session(ws, cfg, cap, load: Load, tag: str,
+                   rotate_after: float | None = None) -> bool:
     """One leg. Returns True if the gateway asked us to rotate (RECONNECT), in
-    which case this leg is handed to _retire and the caller must NOT close it."""
+    which case this leg is handed to _retire and the caller must NOT close it.
+    With `rotate_after`, the leg also retires itself at that age (LEG_ROTATE_S);
+    that ends the session normally (False) with nothing in flight."""
     load.attach(ws)
     await ws.send(json.dumps(P.hello(
         cfg["miner_key"], cfg["model"], cfg["model_root"], hw=cfg["hw"],
@@ -1142,12 +1226,25 @@ async def _session(ws, cfg, cap, load: Load, tag: str) -> bool:
         _heartbeat(ws, cfg.get("hb_s", HEARTBEAT_S), load, cap, cfg["backend"]))
     serving: dict[str, asyncio.Task] = {}
     drained = False
+    rot = (_LegRotation(ws, serving, rotate_after, tag)
+           if rotate_after is not None else None)
     try:
         async for msg in ws:
             frame = json.loads(msg)
             t = frame.get("type")
             if t == P.SERVE:
                 corr = frame["corr_id"]
+                if rot is not None and rot.bouncing:
+                    # This leg is retiring: hand the request back before its
+                    # first token so the gateway serves it on another worker.
+                    req = frame.get("request") or {}
+                    rid = req.get("engy_request_id") or uuid.uuid4().hex
+                    try:
+                        await ws.send(json.dumps(P.response(
+                            corr, rid, {}, error=_ROTATING_ERROR)))
+                    except Exception:
+                        pass
+                    continue
                 task = asyncio.create_task(
                     _serve_one(ws, frame, cfg["backend"], load))
                 serving[corr] = task
@@ -1176,6 +1273,8 @@ async def _session(ws, cfg, cap, load: Load, tag: str) -> bool:
     except websockets.ConnectionClosed:
         pass
     finally:
+        if rot is not None and not rot.rotated:
+            rot.task.cancel()            # the leg ended some other way first
         if drained:
             # Hand the socket to _retire; the caller re-dials at once.
             asyncio.create_task(_retire(ws, hb, serving, load, tag))
@@ -1357,7 +1456,9 @@ async def _leg(i: int, n: int, cfg, cap, load: Load):
                 # answers 504 for a request the serve never even received.
                 max_size=64 * 1024 * 1024)
             doors.opened(door)
-            drained = await _session(ws, cfg, cap, load, tag)
+            # A fresh random lifetime per dial (LEG_ROTATE_S).
+            drained = await _session(ws, cfg, cap, load, tag,
+                                     rotate_after=leg_lifetime())
             if drained:
                 # _retire owns the socket now. Re-dial immediately so the
                 # replacement leg lands on the new colour without a gap.
