@@ -274,6 +274,117 @@ def test_each_serve_is_probed_and_backed_off_independently():
     assert asyncio.run(s._max_total(c, "http://127.0.0.1:30002")) is None
     assert "http://127.0.0.1:30001" not in s._mtt_retry
     assert "http://127.0.0.1:30002" in s._mtt_retry
+
+
+# ---- vLLM: no /get_load, so KV pressure comes from its Prometheus /metrics ----
+
+# The shape prometheus_client renders for a data-parallel (2-engine) vLLM V1
+# serve: labels sorted, one sample per engine, the pool size only as labels of
+# the cache_config_info gauge.
+VLLM_DP2 = """\
+# HELP vllm:num_requests_running Number of requests in model execution batches.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{engine="0",model_name="deepseek-v4.1-flash"} 5.0
+vllm:num_requests_running{engine="1",model_name="deepseek-v4.1-flash"} 3.0
+# HELP vllm:num_requests_waiting Number of requests waiting to be processed.
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting{engine="0",model_name="deepseek-v4.1-flash"} 2.0
+vllm:num_requests_waiting{engine="1",model_name="deepseek-v4.1-flash"} 0.0
+vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4.1-flash",reason="capacity"} 2.0
+# HELP vllm:kv_cache_usage_perc KV-cache usage. 1 means 100 percent usage.
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{engine="0",model_name="deepseek-v4.1-flash"} 0.5
+vllm:kv_cache_usage_perc{engine="1",model_name="deepseek-v4.1-flash"} 0.25
+# HELP vllm:cache_config_info Information of the LLMEngine CacheConfig
+# TYPE vllm:cache_config_info gauge
+vllm:cache_config_info{block_size="16",cache_dtype="auto",enable_prefix_caching="True",engine="0",gpu_memory_utilization="0.9",num_cpu_blocks="None",num_gpu_blocks="10000",prefix_caching_hash_algo="sha256"} 1.0
+vllm:cache_config_info{block_size="16",cache_dtype="auto",enable_prefix_caching="True",engine="1",gpu_memory_utilization="0.9",num_cpu_blocks="None",num_gpu_blocks="10000",prefix_caching_hash_algo="sha256"} 1.0
+"""
+
+# Older vLLM: the pre-V1 gauge name, no engine label, no pool size published.
+VLLM_V0 = """\
+vllm:gpu_cache_usage_perc{model_name="glm-5.2"} 0.875
+vllm:num_requests_running{model_name="glm-5.2"} 7.0
+vllm:num_requests_waiting{model_name="glm-5.2"} 1.0
+"""
+
+SGLANG_METRICS = """\
+# TYPE sglang:token_usage gauge
+sglang:token_usage{model_name="glm-5.2"} 0.42
+sglang:num_running_reqs{model_name="glm-5.2"} 7.0
+"""
+
+
+def test_vllm_metrics_give_tokens_used_against_the_pool_summed_over_engines():
+    kv = tm._vllm_kv_from_metrics(VLLM_DP2)
+    # 2 engines x 10000 blocks x 16 tokens; 0.5 and 0.25 of each.
+    assert kv == {"used": 80000 + 40000, "limit": 320000, "frac": 0.375,
+                  "reqs": 8, "waiting": 2, "ranks": 2}
+
+
+def test_older_vllm_without_a_pool_size_still_reports_how_full_it_is():
+    """The gate reads frac; a serve that cannot size its pool must not be
+    reported as empty, which would admit it while it is 87.5% full."""
+    kv = tm._vllm_kv_from_metrics(VLLM_V0)
+    assert kv["frac"] == 0.875
+    assert kv["limit"] == 0 and kv["used"] == 0
+    assert kv["reqs"] == 7 and kv["waiting"] == 1 and kv["ranks"] == 1
+
+
+def test_a_pool_size_of_none_before_profiling_falls_back_to_the_fraction():
+    text = VLLM_DP2.replace('num_gpu_blocks="10000"', 'num_gpu_blocks="None"')
+    kv = tm._vllm_kv_from_metrics(text)
+    assert kv["limit"] == 0
+    assert kv["frac"] == 0.375                  # mean of 0.5 and 0.25
+
+
+def test_metrics_that_are_not_vllm_are_not_mistaken_for_it():
+    assert tm._vllm_kv_from_metrics(SGLANG_METRICS) is None
+    assert tm._vllm_kv_from_metrics("") is None
+
+
+def _routes(monkeypatch, routes):
+    """Point every httpx client the miner opens at `routes`: {path: (status, body)}."""
+    def handler(request):
+        status, body = routes.get(request.url.path, (404, "not found"))
+        if isinstance(body, str):
+            return tm.httpx.Response(status, text=body)
+        return tm.httpx.Response(status, json=body)
+
+    real = tm.httpx.AsyncClient
+
+    def client(*a, **kw):
+        return real(*a, transport=tm.httpx.MockTransport(handler), **kw)
+
+    monkeypatch.setattr(tm.httpx, "AsyncClient", client)
+
+
+def test_kv_load_falls_back_to_vllm_metrics_when_there_is_no_get_load(monkeypatch):
+    _routes(monkeypatch, {"/metrics": (200, VLLM_DP2)})
+    kv = asyncio.run(_kv_serve().kv_load())
+    assert kv["frac"] == 0.375 and kv["limit"] == 320000 and kv["used"] == 120000
+    assert kv["reqs"] == 8 and kv["waiting"] == 2 and kv["ranks"] == 2
+
+
+def test_kv_load_reports_a_fraction_only_vllm_serve(monkeypatch):
+    _routes(monkeypatch, {"/metrics": (200, VLLM_V0)})
+    kv = asyncio.run(_kv_serve().kv_load())
+    assert kv["frac"] == 0.875 and "limit" not in kv
+
+
+def test_kv_load_still_prefers_sglang_get_load(monkeypatch):
+    _routes(monkeypatch, {
+        "/get_load": (200, [{"num_tokens": 500, "num_reqs": 2,
+                             "num_waiting_reqs": 0, "num_pending_tokens": 0}]),
+        "/get_server_info": (200, {"max_total_num_tokens": 1000}),
+        "/metrics": (200, VLLM_DP2)})
+    kv = asyncio.run(_kv_serve().kv_load())
+    assert kv["used"] == 500 and kv["limit"] == 1000 and kv["frac"] == 0.5
+
+
+def test_kv_load_is_none_for_a_serve_with_neither(monkeypatch):
+    _routes(monkeypatch, {"/metrics": (200, SGLANG_METRICS)})
+    assert asyncio.run(_kv_serve().kv_load()) is None
 # ---------------------------------------------------------- template dialects
 # The prod gateway normalizes every buyer `reasoning_effort` onto "high"/"max",
 # and Qwen3.8's chat template 400s on both. These pin the translation, and pin
