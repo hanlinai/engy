@@ -667,6 +667,82 @@ def _text_completion(model, text, usage, finish_reason="stop",
 # reporting KV pressure within a minute of coming up.
 _MTT_RETRY_S = 60.0
 
+# vLLM has no /get_load. It publishes the same pressure on its Prometheus
+# /metrics instead: `vllm:kv_cache_usage_perc` (0..1, one sample per engine;
+# vLLM before the V1 rename called it `vllm:gpu_cache_usage_perc`), running and
+# waiting request counts, and the pool size as labels of the info gauge
+# `vllm:cache_config_info` (num_gpu_blocks x block_size tokens).
+_PROM_SAMPLE = re.compile(r'^([A-Za-z_:][A-Za-z0-9_:]*)(?:\{(.*)\})?\s+(\S+)')
+_PROM_LABEL = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)="((?:[^"\\]|\\.)*)"')
+_VLLM_METRICS = frozenset({
+    "vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc",
+    "vllm:num_requests_running", "vllm:num_requests_waiting",
+    "vllm:cache_config_info"})
+
+
+def _vllm_kv_from_metrics(text: str) -> dict | None:
+    """One vLLM serve's KV pressure from its /metrics text, in the shape
+    `Serve.kv_load` sums: used/limit in tokens, reqs, waiting, ranks (one per
+    engine, so a data-parallel serve counts each engine like sglang's DP ranks)
+    and frac. `limit` is 0 when the pool size is not published (vLLM before
+    num_gpu_blocks became a label, or a scrape taken before the engine finished
+    profiling memory); `frac` is then the mean usage across engines, which is
+    what the gateway's KV gate reads. None when the text carries no vLLM usage
+    gauge at all: not a vLLM serve."""
+    usage: dict = {}
+    usage_v0: dict = {}
+    running: dict = {}
+    waiting: dict = {}
+    pools: dict = {}
+    for line in text.splitlines():
+        if not line.startswith("vllm:"):
+            continue
+        m = _PROM_SAMPLE.match(line)
+        if not m or m.group(1) not in _VLLM_METRICS:
+            continue
+        name = m.group(1)
+        labels = dict(_PROM_LABEL.findall(m.group(2) or ""))
+        engine = labels.get("engine") or "0"
+        if name == "vllm:cache_config_info":
+            try:
+                pools[engine] = (int(labels["num_gpu_blocks"])
+                                 * int(labels["block_size"]))
+            except (KeyError, ValueError):
+                pass                   # "None" before memory profiling is done
+            continue
+        try:
+            value = float(m.group(3))
+        except ValueError:
+            continue
+        if name == "vllm:kv_cache_usage_perc":
+            usage[engine] = value
+        elif name == "vllm:gpu_cache_usage_perc":
+            usage_v0[engine] = value
+        elif name == "vllm:num_requests_running":
+            running[engine] = running.get(engine, 0) + int(value)
+        else:
+            waiting[engine] = waiting.get(engine, 0) + int(value)
+    usage = usage or usage_v0
+    if not usage:
+        return None
+    used = limit = 0
+    for engine, frac in usage.items():
+        frac = min(max(frac, 0.0), 1.0)
+        # The cache config is shared by every engine of a serve, so a sample
+        # without its own engine label still sizes the pool.
+        pool = pools.get(engine) or next(iter(pools.values()), 0)
+        if not pool:
+            used = limit = 0
+            break
+        used += round(frac * pool)
+        limit += pool
+    fracs = [min(max(f, 0.0), 1.0) for f in usage.values()]
+    return {"used": used, "limit": limit,
+            "frac": round(used / limit if limit else sum(fracs) / len(fracs), 4),
+            "reqs": sum(running.values()), "waiting": sum(waiting.values()),
+            "ranks": len(usage)}
+
+
 class Serve:
     """The local OpenAI-compatible serve, least-in-flight balanced across urls.
 
@@ -817,14 +893,27 @@ class Serve:
         self._mtt_retry[root] = time.monotonic() + _MTT_RETRY_S
         return None
 
+    async def _vllm_kv(self, c, root: str):
+        """KV pressure of a vLLM serve at `root`, from its /metrics. None if the
+        serve does not answer or is not vLLM. See `_vllm_kv_from_metrics`."""
+        try:
+            r = await c.get(root + "/metrics")
+            r.raise_for_status()
+            return _vllm_kv_from_metrics(r.text)
+        except Exception:
+            return None
+
     async def kv_load(self):
         """Live KV-cache pressure across the local serve(s): tokens occupied vs
         the pool size, summed over every scheduler of every serve url, from
-        sglang `/get_load` + `max_total_num_tokens`. Cheap (two GETs) and never
-        raises. Returns None if no serve exposes `/get_load` (older sglang /
-        vLLM) — the gateway then judges this worker on in-flight count alone."""
+        sglang `/get_load` + `max_total_num_tokens`, or for a vLLM serve (no
+        /get_load) from its /metrics. Cheap (two GETs per serve) and never
+        raises. Returns None if no serve exposes either (older sglang, or an
+        engine that is neither) — the gateway then judges this worker on
+        in-flight count alone."""
         used = reqs = waiting = pending = ranks = 0
         limit = 0
+        fracs = []          # serves that report a fraction but no pool size
         got = False
         try:
             timeout = httpx.Timeout(4.0, connect=3.0)
@@ -836,8 +925,20 @@ class Serve:
                         r.raise_for_status()
                         load = r.json()
                     except Exception:
-                        continue
+                        load = None
                     if not isinstance(load, list) or not load:
+                        v = await self._vllm_kv(c, root)
+                        if v is None:
+                            continue
+                        used += v["used"]
+                        reqs += v["reqs"]
+                        waiting += v["waiting"]
+                        ranks += v["ranks"]
+                        if v["limit"]:
+                            limit += v["limit"]
+                        else:
+                            fracs.append(v["frac"])
+                        got = True
                         continue
                     mtt = await self._max_total(c, root)
                     for x in load:
@@ -860,6 +961,10 @@ class Serve:
         if limit:
             kv["limit"] = limit
             kv["frac"] = round(used / limit, 4) if limit else None
+        if fracs:
+            # A serve with no pool size can only say how full it is. Report the
+            # fullest view rather than diluting it with a pool it isn't part of.
+            kv["frac"] = round(max([kv.get("frac") or 0.0] + fracs), 4)
         return kv
 
     @staticmethod
