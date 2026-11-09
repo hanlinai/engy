@@ -382,6 +382,31 @@ def test_kv_load_still_prefers_sglang_get_load(monkeypatch):
     assert kv["used"] == 500 and kv["limit"] == 1000 and kv["frac"] == 0.5
 
 
+SGLANG_V1_LOADS = {"loads": [{"dp_rank": 0, "num_running_reqs": 6,
+                               "num_waiting_reqs": 4, "num_used_tokens": 10613473,
+                               "max_total_num_tokens": 11536384,
+                               "token_usage": 0.92}]}
+
+
+def test_kv_load_falls_back_to_sglang_v1_loads_when_get_load_is_gone(monkeypatch):
+    """Newer sglang 404s /get_load and serves /v1/loads; the engine queue
+    (waiting) must still reach the gateway, and the pool is not rescaled by
+    dcp_size (it is already global on these serves)."""
+    _routes(monkeypatch, {"/v1/loads": (200, SGLANG_V1_LOADS),
+                          "/get_server_info": (200, {"max_total_num_tokens": 11536384,
+                                                     "dcp_size": 8})})
+    kv = asyncio.run(_kv_serve().kv_load())
+    assert kv["limit"] == 11536384 and kv["frac"] == 0.92
+    assert kv["waiting"] == 4 and kv["reqs"] == 6 and kv["ranks"] == 1
+
+
+def test_sglang_v1_loads_wins_over_vllm_metrics(monkeypatch):
+    _routes(monkeypatch, {"/v1/loads": (200, SGLANG_V1_LOADS),
+                          "/metrics": (200, VLLM_DP2)})
+    kv = asyncio.run(_kv_serve().kv_load())
+    assert kv["limit"] == 11536384
+
+
 def test_kv_load_is_none_for_a_serve_with_neither(monkeypatch):
     _routes(monkeypatch, {"/metrics": (200, SGLANG_METRICS)})
     assert asyncio.run(_kv_serve().kv_load()) is None

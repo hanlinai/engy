@@ -893,6 +893,46 @@ class Serve:
         self._mtt_retry[root] = time.monotonic() + _MTT_RETRY_S
         return None
 
+    async def _sglang_v1_loads(self, c, root: str):
+        """KV pressure of a newer sglang serve at `root` from `/v1/loads`, the
+        successor of /get_load: {"loads": [{num_used_tokens,
+        max_total_num_tokens, num_running_reqs, num_waiting_reqs,
+        token_usage, ...}, ...]}, one entry per DP rank. None if the serve does
+        not answer it.
+
+        The pool here is already at the same (global) scale as
+        num_used_tokens: on a DCP8 serve num_used_tokens / token_usage ==
+        max_total_num_tokens. So unlike /get_server_info's figure for
+        /get_load, it is NOT multiplied by dcp_size. token_usage, the engine's
+        own used/max ratio, sets `used` when present."""
+        try:
+            r = await c.get(root + "/v1/loads")
+            r.raise_for_status()
+            loads = (r.json() or {}).get("loads")
+        except Exception:
+            return None
+        if not isinstance(loads, list) or not loads:
+            return None
+        used = reqs = waiting = limit = ranks = 0
+        for x in loads:
+            if not isinstance(x, dict):
+                continue
+            mtt = int(x.get("max_total_num_tokens", 0) or 0)
+            u = int(x.get("num_used_tokens", 0) or 0)
+            tu = x.get("token_usage")
+            if mtt and isinstance(tu, (int, float)):
+                u = int(round(float(tu) * mtt))
+            used += u
+            limit += mtt
+            reqs += int(x.get("num_running_reqs", 0) or 0)
+            waiting += int(x.get("num_waiting_reqs", 0) or 0)
+            ranks += 1
+        if not ranks:
+            return None
+        return {"used": used, "reqs": reqs, "waiting": waiting, "ranks": ranks,
+                "limit": limit or None,
+                "frac": round(used / limit, 4) if limit else None}
+
     async def _vllm_kv(self, c, root: str):
         """KV pressure of a vLLM serve at `root`, from its /metrics. None if the
         serve does not answer or is not vLLM. See `_vllm_kv_from_metrics`."""
@@ -906,8 +946,8 @@ class Serve:
     async def kv_load(self):
         """Live KV-cache pressure across the local serve(s): tokens occupied vs
         the pool size, summed over every scheduler of every serve url, from
-        sglang `/get_load` + `max_total_num_tokens`, or for a vLLM serve (no
-        /get_load) from its /metrics. Cheap (two GETs per serve) and never
+        sglang `/get_load` + `max_total_num_tokens`, from a newer sglang's
+        `/v1/loads` (no /get_load), or for a vLLM serve from its /metrics. Cheap (two GETs per serve) and never
         raises. Returns None if no serve exposes either (older sglang, or an
         engine that is neither) — the gateway then judges this worker on
         in-flight count alone."""
@@ -927,7 +967,11 @@ class Serve:
                     except Exception:
                         load = None
                     if not isinstance(load, list) or not load:
-                        v = await self._vllm_kv(c, root)
+                        # Newer sglang serves load at /v1/loads instead of
+                        # /get_load; then fall through to a vLLM /metrics serve.
+                        v = await self._sglang_v1_loads(c, root)
+                        if v is None:
+                            v = await self._vllm_kv(c, root)
                         if v is None:
                             continue
                         used += v["used"]
