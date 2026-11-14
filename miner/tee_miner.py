@@ -610,9 +610,12 @@ def _clean_usage(raw: dict) -> dict:
     u["total_tokens"] = int(raw.get("total_tokens") or
                             u["prompt_tokens"] + u["completion_tokens"])
     details = raw.get("prompt_tokens_details")
-    if isinstance(details, dict) and details.get("cached_tokens") is not None:
-        u["prompt_tokens_details"] = {
-            "cached_tokens": int(details["cached_tokens"])}
+    if isinstance(details, dict):
+        prompt_details = {key: int(details[key])
+                          for key in ("cached_tokens", "cache_write_tokens")
+                          if details.get(key) is not None}
+        if prompt_details:
+            u["prompt_tokens_details"] = prompt_details
     # Thinking tokens, a SUBSET of completion_tokens. sglang reports this FLAT
     # on `usage.reasoning_tokens` (its own UsageInfo field); the gateway edge
     # translates it into OpenAI's nested `completion_tokens_details` before a
@@ -1125,10 +1128,11 @@ class Serve:
                     # rate, which is exactly backwards for span scoring, the
                     # one workload that re-sends an identical multi-thousand
                     # token prefix on every request.
-                    cached = meta.get("cached_tokens")
-                    if cached is not None:
-                        usage["prompt_tokens_details"] = {
-                            "cached_tokens": int(cached)}
+                    prompt_details = {key: int(meta[key])
+                                      for key in ("cached_tokens", "cache_write_tokens")
+                                      if meta.get(key) is not None}
+                    if prompt_details:
+                        usage["prompt_tokens_details"] = prompt_details
                     fr = meta.get("finish_reason")
                     finish = (fr.get("type") if isinstance(fr, dict) else fr) or "stop"
                     return _text_completion(model, j.get("text") or "", usage,
