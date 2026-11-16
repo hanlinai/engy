@@ -140,12 +140,79 @@ Four principles drive the topology:
 
 ## Scoring & emission split
 
-Settlement is per **(miner, model)** pair, integer-only fixed-point
-(floating-point results are not reproducible across validator implementations, so
-any arithmetic change is a consensus change). Epochs are **weekly** in prod (4h on
-staging), scored fresh from that epoch's slice of the request log.
+Settlement is integer-only fixed-point (floating-point results are not
+reproducible across validator implementations, so any arithmetic change is a
+consensus change). Epochs are **weekly** in prod (1h on staging), scored fresh
+from that epoch's data.
 
-**Per-(miner, model) score:**
+Each epoch's 65535 weight budget is split in two, each normalized on its own:
+
+| Share | Budget | Who earns it | Paid for |
+|---|---|---|---|
+| **80%, baseline pool** | 52428 | enrolled servers in the current **hardware classes** | being online and serving whatever model we assign |
+| **20%, traffic** | 13107 | every bound, unbanned miner | paid buyer traffic that passes the four gates |
+
+### Baseline pool (80%): the mechanism
+
+The baseline pool pays for **capacity we want to keep**, independent of how
+much buyer traffic the router happened to send a given machine. It is defined by
+a set of **hardware classes that we review and adjust periodically** as model
+demand and the hardware market change. Which classes exist, how many servers of
+each we want and what each is worth are configuration; the mechanism below is
+what stays fixed.
+
+- **Hardware classes.** A class is a server shape (e.g. a standard 8-GPU
+  server of one GPU type) plus the minimum it must meet for the models we plan
+  for it, such as model-disk size. Only servers that match a current class are
+  enrolled, and every qualifying server counts as **one unit** of its class. The
+  hardware is read by engy itself during onboarding (GPU class, count and
+  memory, GPU IDs not claimed by another server, model-disk size), not taken
+  from the server's own report, and it is re-checked on every sample.
+- **Sub-pools.** The pool is split into one sub-pool per class, in proportion
+  to **how many servers of that class we want × its base price**, the base
+  price reflecting what one such server costs to rent. Each sub-pool is divided
+  among its own servers only, so one class never dilutes another, and it is
+  **always paid out in full**: fewer servers than the target means a larger
+  share each. An empty sub-pool burns its share. The split is frozen into each
+  epoch's signed params, so an adjustment applies from the next epoch on.
+- **Counting starts when it really serves.** Enrolment alone earns nothing.
+  A server starts counting at its first sample in which a worker has deployed
+  a model, connected to the gateway, passed verification and is active; from
+  then on every sample counts, up or down.
+- **Model-agnostic.** Enrolled servers agree that we may switch the model they
+  serve at any time, as demand requires. Which model a server runs never
+  affects its share. While **we** switch a server's model, it counts as online
+  for a grace window (1h); a switch the owner starts earns no grace.
+- **Uptime, sampled.** Every 5 minutes each counting server is sampled once. A
+  server is **up** in a sample if **any** of its workers is connected and
+  active. A sample slot where the sampler itself was down is dropped for
+  everyone, so a sampler outage costs nobody.
+- **Share within a sub-pool.** `pool_score = uptime_ppm`, where
+  `uptime_ppm = up_slots × 1e6 ÷ observed_slots` over the epoch, and the
+  sub-pool is divided by `pool_score`. A server that joins or leaves mid-epoch
+  is pro-rated: it earns only the slots it was counting for.
+- **Public.** Each epoch's pool rows (`server_id`, class, uptime, weight) are in
+  the signed result and on the epoch, miner and leaderboard pages.
+
+### Baseline pool: current configuration
+
+For the current period the classes are **B300 and B200, split 70 / 30**:
+
+| Class | Server | Model disk | Base price | Share of pool | Share of all emission |
+|---|---|---|---|---|---|
+| B300 | standard 8x B300 | ≥ 2 TB | 200 | **70%** | 56% |
+| B200 | standard 8x B200 | ≥ 1 TB | 100 | **30%** | 24% |
+
+B300 is the larger class because we want more capacity for the largest models;
+B200 stays as the cost-effective server for the high-volume flash models. When
+the classes are next adjusted, this table changes; the mechanism above does not.
+
+### Traffic (20%)
+
+The traffic budget uses the same per-(miner, model) score as before the split,
+unchanged, and is open to every miner, enrolled or not.
+
+**Traffic score, per (miner, model):**
 
 ```
 tokens(r) = prompt_tokens + completion_tokens
@@ -181,18 +248,21 @@ score     = floor( Σ tokens(r) · score_rate[model] / 1000 )   if every gate pa
   and never entered scoring at all, so miner-attributable failure is exactly
   **502** and **504**.
 
-**Score to on-chain weight (`weight_u16`).** One normalization onto 65535: each
-row's share is `score_micro ÷ Σ score_micro`, with the rounding remainder going to
-the highest-scoring row. There are no model pools and no pool floor; cross-model
-comparability comes from `score_rate` instead, which is the same lever with one
-fewer mechanism.
+**Score to weight (`weight_u16`).** Each budget is normalized separately: a
+row's share of its budget is `score ÷ Σ score`, with the rounding remainder
+going to that budget's top row. A miner's on-chain weight is the sum of its
+pool and traffic rows. Cross-model comparability inside the traffic budget comes
+from `score_rate`.
 
-**Burn.** If there is no billed traffic (or every score is 0), the whole 65535
-goes to the owner hotkey.
+**Burn.** A budget with nothing to pay (no enrolled server online, or no
+scoring traffic) goes to the owner hotkey; the other budget is unaffected.
 
 **Emission.** The weight vector applied under Yuma consensus. A fresh key starts
-at zero (registration churn is unprofitable); a miner that trips any gate earns
-nothing that epoch and recovers the next one.
+at zero (registration churn is unprofitable); a miner that trips a traffic gate
+earns no traffic share that epoch and recovers the next one.
+
+**Activation.** The 80/20 split takes effect from a cutover epoch announced in
+advance. Until then, 100% of the budget follows the traffic score.
 
 ---
 
@@ -206,6 +276,13 @@ control plane, **engy-traffic**, which earns a new miner its place with **probe
 traffic** and **TOPLOC proof** before any buyer request reaches it.
 
 ### Onboarding a new subnet miner
+
+**Who may onboard.** A server in a current **baseline-pool hardware class**
+(today a standard 8-GPU B300 or B200 server; see the baseline pool) onboards
+after basic verification:
+SSH reach, its miner key, and its hardware as engy reads it. Any other server must either pass
+**TEE attestation** (a verified CPU-TEE quote) or belong to a **whitelisted**
+(approved) provider; otherwise onboarding is refused.
 
 A permissionless miner is a stranger, so it proves itself before it touches paid
 traffic. engy-traffic drives **synthetic probe traffic** at a newly connected
