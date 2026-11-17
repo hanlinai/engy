@@ -187,16 +187,29 @@ what stays fixed.
   server is **up** in a sample if **any** of its workers is connected and
   active. A sample slot where the sampler itself was down is dropped for
   everyone, so a sampler outage costs nobody.
-- **Share within a sub-pool.** `pool_score = uptime_ppm`, where
-  `uptime_ppm = up_slots × 1e6 ÷ observed_slots` over the epoch, and the
-  sub-pool is divided by `pool_score`. A server that joins or leaves mid-epoch
-  is pro-rated: it earns only the slots it was counting for.
-- **Public.** Each epoch's pool rows (`server_id`, class, uptime, weight) are in
-  the signed result and on the epoch, miner and leaderboard pages.
+- **Continuous uptime (vesting).** Inference must be highly available, so the
+  pool pays for **continuous** service. A server's uptime is held as pending
+  until it has been in the pool for **5 days without an outage** (10 minutes or
+  more down). It is then paid in full in that epoch, back pay included, and paid
+  as it goes from then on. An outage before that forfeits the pending part and
+  restarts the clock. Spot/preemptible capacity that is reclaimed after a few
+  days therefore earns nothing from the pool. A single missed sample is not an
+  outage; slots where many servers are down at once (an outage on our side) and
+  model switches we start never count against a server.
+- **Share within a sub-pool.** `pool_score = paid_slots × 1e6 ÷ observed_slots`,
+  where `paid_slots` are the vested up slots paid in the epoch (back pay
+  included) and `observed_slots` the epoch's sampled slots; the sub-pool is
+  divided by `pool_score`. A sub-pool whose servers are all still pending burns
+  its share. A server that joins or leaves mid-epoch earns only the slots it
+  was counting for.
+- **Public.** Each epoch's pool rows (`server_id`, class, uptime, outages,
+  vesting state, weight) are in the signed result and on the epoch, miner and
+  leaderboard pages.
 
 ### Baseline pool: current configuration
 
-For the current period the classes are **B300 and B200, split 70 / 30**:
+For the current period the classes are **B300 and B200, split 70 / 30**, with a
+**5-day** vesting period. Both apply from **epoch 23**:
 
 | Class | Server | Model disk | Base price | Share of pool | Share of all emission |
 |---|---|---|---|---|---|
