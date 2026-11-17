@@ -195,7 +195,9 @@ what stays fixed.
   restarts the clock. Spot/preemptible capacity that is reclaimed after a few
   days therefore earns nothing from the pool. A single missed sample is not an
   outage; slots where many servers are down at once (an outage on our side) and
-  model switches we start never count against a server.
+  model switches we start never count against a server. At launch, a server
+  that had already been serving continuously for 5 days before epoch 23 is
+  credited with that time once it joins, so it is paid from its first sample.
 - **Share within a sub-pool.** `pool_score = paid_slots × 1e6 ÷ observed_slots`,
   where `paid_slots` are the vested up slots paid in the epoch (back pay
   included) and `observed_slots` the epoch's sampled slots; the sub-pool is
