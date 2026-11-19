@@ -1409,10 +1409,6 @@ async def _session(ws, cfg, cap, load: Load, tag: str,
             elif t == P.ADMIT:
                 print(f"[tee_miner] {tag} ADMITTED", flush=True)
                 wid = frame.get("worker_id")
-                if not wid and cfg.get("require_tee_identity"):
-                    sys.exit("tee_miner: the gateway ADMITTed this worker "
-                             "without a worker_id and ENGY_REQUIRE_TEE_IDENTITY "
-                             "is set; refusing to serve unidentified.")
                 _announce_worker_id(wid, cfg["worker_name"])
             elif t == P.DENY:
                 print(f"[tee_miner] {tag} DENIED: {frame.get('reason')}",
@@ -1882,10 +1878,6 @@ def main(argv=None):
     p.add_argument("--dialect", default=_env("ENGY_TEMPLATE_DIALECT"),
                    help="force a chat-template dialect (see _DIALECTS) instead "
                         "of matching on the model id")
-    p.add_argument("--require-tee-identity", action="store_true",
-                   default=_env("ENGY_REQUIRE_TEE_IDENTITY") == "1",
-                   help="exit if the gateway ADMITs this worker without a "
-                        "worker_id")
     args = p.parse_args(argv)
 
     miner_key = _resolve_miner_key(args.miner_key)
@@ -1918,7 +1910,6 @@ def main(argv=None):
         "model": args.model,
         "miner_key": miner_key,
         "worker_name": worker_name,
-        "require_tee_identity": args.require_tee_identity,
         "model_root": _model_root(args.checkpoint),
         "hw": _detect_hw(),
         "backend": Serve(serve_urls, args.served_model, args.read_timeout,

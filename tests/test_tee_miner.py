@@ -1115,20 +1115,6 @@ def test_admit_without_worker_id_prints_unknown(monkeypatch, capsys):
     assert "worker_id=unknown worker_name=w1" in capsys.readouterr().out
 
 
-def test_require_tee_identity_exits_on_admit_without_worker_id(monkeypatch):
-    monkeypatch.setattr(tm, "_worker_id_announced", False)
-    with pytest.raises(SystemExit) as e:
-        _run_session(_AdmitWS({"type": tm.P.ADMIT}),
-                     _name_cfg(require_tee_identity=True))
-    assert e.value.code not in (0, None)
-
-
-def test_require_tee_identity_serves_when_admit_has_worker_id(monkeypatch):
-    monkeypatch.setattr(tm, "_worker_id_announced", False)
-    _run_session(_AdmitWS({"type": tm.P.ADMIT, "worker_id": "w-1"}),
-                 _name_cfg(require_tee_identity=True))
-
-
 def test_main_ignores_env_worker_id_with_one_warning(monkeypatch, capsys):
     async def stop(cfg, cap, load):
         assert "worker_id" not in cfg
