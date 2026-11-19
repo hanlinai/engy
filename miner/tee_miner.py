@@ -338,6 +338,97 @@ def _model_root(checkpoint: str) -> str:
 
 
 # ----------------------------------------------------------------------- load
+# ---------------------------------------------------- engine prefill backlog
+# Work-based load (2026-11-19). Request counts under-read a prefill-bound box:
+# on the K3.1 B300s a box with 2 requests in flight was measured spending 400 s
+# on other requests' prefill. sglang /v1/loads knows the real backlog, so the
+# kv block also carries (summed over serves / DP ranks):
+#   uncached  `num_waiting_uncached_tokens`: uncached prompt tokens still to
+#             prefill (waiting queue + the chunk-in-progress remainder);
+#   pf_tps    prefill tok/s WHILE prefilling, from the cumulative
+#             `total_prefill_uncached_tokens` / `total_prefill_busy_us`
+#             counters between two samples (EWMA, >= PF_MIN_BUSY_S busy);
+#   pf_busy   prefill busy share as sglang counts it (only back-to-back prefill
+#             steps add time, so with --prefill-decode-interval 1 it
+#             UNDER-reads: a lower bound, display only; pf_tps is unaffected).
+# The gateway (engy-core registry knobs prefill_engine_backlog /
+# prefill_load_s) turns these into a backlog in seconds and routes on it.
+# Mirror of engy-core `engy.refminer.prefill_backlog_fields`; keep in sync.
+PF_MIN_BUSY_S = 0.5
+PF_RATE_ALPHA = 0.3
+
+
+def prefill_backlog_fields(loads, prev):
+    """(fields, new_state) from one /v1/loads `loads` list; `prev` is the
+    previous call's state for the same serve (None first). Fields are omitted
+    when the serve does not expose them. Pure; never raises."""
+    fields: dict = {}
+    if not isinstance(loads, list):
+        return fields, prev
+    unc = tok = busy = 0
+    have_unc = have_ctr = False
+    ts = None
+    for x in loads:
+        if not isinstance(x, dict):
+            continue
+        try:
+            if x.get("num_waiting_uncached_tokens") is not None:
+                unc += max(0, int(x["num_waiting_uncached_tokens"]))
+                have_unc = True
+            if (x.get("total_prefill_uncached_tokens") is not None
+                    and x.get("total_prefill_busy_us") is not None):
+                tok += int(x["total_prefill_uncached_tokens"])
+                busy += int(x["total_prefill_busy_us"])
+                have_ctr = True
+            if x.get("timestamp") is not None:
+                ts = max(ts or 0.0, float(x["timestamp"]))
+        except (TypeError, ValueError):
+            continue
+    if have_unc:
+        fields["uncached"] = unc
+    if not have_ctr:
+        return fields, prev
+    now = ts if ts is not None else time.time()
+    state = {"t": now, "tok": tok, "busy": busy,
+             "rate": (prev or {}).get("rate")}
+    if prev and now > prev.get("t", now):
+        d_tok = tok - prev["tok"]
+        d_busy_s = (busy - prev["busy"]) / 1e6
+        dt = now - prev["t"]
+        if d_tok >= 0 and d_busy_s >= 0:          # a serve restart resets both
+            fields["pf_busy"] = round(min(1.0, d_busy_s / dt), 4)
+            if d_busy_s >= PF_MIN_BUSY_S and d_tok > 0:
+                r = d_tok / d_busy_s
+                old = state["rate"]
+                state["rate"] = r if old is None else (
+                    PF_RATE_ALPHA * r + (1 - PF_RATE_ALPHA) * old)
+    if state["rate"]:
+        fields["pf_tps"] = int(state["rate"])
+    return fields, state
+
+
+# Event-driven backlog push. The 10 s heartbeat is too slow for a backlog that
+# jumps by a whole cold 300k prompt in one request: every ENGY_BACKLOG_PUSH_S
+# one process-wide task re-reads the serve and pushes a kv frame to every leg
+# when the uncached backlog moved >= ENGY_BACKLOG_PUSH_MIN_TOKENS (or crossed
+# zero), and at least every BACKLOG_PUSH_MAX_S. 0 = off. Cost: one local GET
+# per serve per period.
+BACKLOG_PUSH_S = float(_env("ENGY_BACKLOG_PUSH_S", "2"))
+BACKLOG_PUSH_MIN_TOKENS = int(_env("ENGY_BACKLOG_PUSH_MIN_TOKENS", "8192"))
+BACKLOG_PUSH_MAX_S = 10.0
+
+
+def backlog_moved(prev, cur, min_tokens: int = BACKLOG_PUSH_MIN_TOKENS) -> bool:
+    """Is the change from `prev` to `cur` uncached tokens worth a frame? Pure."""
+    if cur is None:
+        return False
+    if prev is None:
+        return True
+    if (prev == 0) != (cur == 0):
+        return True
+    return abs(cur - prev) >= min_tokens
+
+
 class Load:
     """In-flight count shared across every leg of this process. A per-leg
     counter would report only that leg's share, which is exactly the partial
@@ -364,6 +455,17 @@ class Load:
 
     def idle_seconds(self) -> float:
         return 0.0 if self.inflight else time.time() - self.last_idle
+
+    async def push_kv(self, kv: dict) -> None:
+        """One heartbeat frame with a fresh kv sample to EVERY leg (see
+        `_backlog_watch`). Best-effort per leg, like `broadcast`."""
+        for ws in list(self._channels):
+            try:
+                await ws.send(json.dumps(P.heartbeat(
+                    inflight=self.inflight,
+                    idle_seconds=self.idle_seconds(), kv=kv)))
+            except Exception:
+                self._channels.discard(ws)
 
     async def broadcast(self) -> None:
         """Push the true count to EVERY leg the moment it changes.
@@ -765,6 +867,7 @@ class Serve:
         self._down: set[str] = set()
         self._mtt: dict = {}   # per-serve KV pool size, cached (fixed per serve)
         self._mtt_retry: dict = {}   # per-serve: earliest monotonic retry
+        self._pf_prev: dict = {}     # per-serve /v1/loads prefill counters
 
     def _pick(self) -> str:
         pool = [u for u in self.urls if u not in self._down] or self.urls
@@ -932,9 +1035,11 @@ class Serve:
             ranks += 1
         if not ranks:
             return None
+        pf, self._pf_prev[root] = prefill_backlog_fields(
+            loads, self._pf_prev.get(root))
         return {"used": used, "reqs": reqs, "waiting": waiting, "ranks": ranks,
                 "limit": limit or None,
-                "frac": round(used / limit, 4) if limit else None}
+                "frac": round(used / limit, 4) if limit else None, "pf": pf}
 
     async def _vllm_kv(self, c, root: str):
         """KV pressure of a vLLM serve at `root`, from its /metrics. None if the
@@ -958,6 +1063,9 @@ class Serve:
         limit = 0
         fracs = []          # serves that report a fraction but no pool size
         got = False
+        unc = None          # engine prefill backlog, summed over serves
+        tps = []            # (rate, weight) per serve for a combined rate
+        busy = []
         try:
             timeout = httpx.Timeout(4.0, connect=3.0)
             async with httpx.AsyncClient(timeout=timeout) as c:
@@ -985,6 +1093,13 @@ class Serve:
                             limit += v["limit"]
                         else:
                             fracs.append(v["frac"])
+                        pf = v.get("pf") or {}
+                        if "uncached" in pf:
+                            unc = (unc or 0) + pf["uncached"]
+                        if pf.get("pf_tps"):
+                            tps.append(pf["pf_tps"])
+                        if "pf_busy" in pf:
+                            busy.append(pf["pf_busy"])
                         got = True
                         continue
                     mtt = await self._max_total(c, root)
@@ -1012,6 +1127,14 @@ class Serve:
             # A serve with no pool size can only say how full it is. Report the
             # fullest view rather than diluting it with a pool it isn't part of.
             kv["frac"] = round(max([kv.get("frac") or 0.0] + fracs), 4)
+        if unc is not None:
+            kv["uncached"] = unc
+        if tps:
+            # One worker, several serves: their prefill rates add up (each
+            # serve prefills its own queue in parallel).
+            kv["pf_tps"] = int(sum(tps))
+        if busy:
+            kv["pf_busy"] = round(max(busy), 4)
         return kv
 
     @staticmethod
@@ -1271,6 +1394,30 @@ async def _serve_one(ws, frame, backend: Serve, load: Load):
         # way, so the miner would slowly strangle itself.
         load.done()
         await load.broadcast()
+
+
+async def _backlog_watch(load: Load, backend, interval: float = BACKLOG_PUSH_S):
+    """Process-wide: push a kv frame to every leg when the engine's prefill
+    backlog moved (see BACKLOG_PUSH_S). Never raises out of the loop."""
+    if backend is None or interval <= 0:
+        return
+    last = None
+    last_t = 0.0
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            kv = await backend.kv_load()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            continue
+        if not isinstance(kv, dict) or "uncached" not in kv:
+            continue
+        cur = int(kv["uncached"])
+        now = time.monotonic()
+        if backlog_moved(last, cur) or (now - last_t) >= BACKLOG_PUSH_MAX_S:
+            await load.push_kv(kv)
+            last, last_t = cur, now
 
 
 async def _heartbeat(ws, interval: float, load: Load, cap: dict, backend=None):
@@ -1802,6 +1949,9 @@ async def _supervise(cfg, capacity: dict, load: Load):
       touches an existing leg — cancelling a live leg 504s its streams.
     """
     backend: Serve = cfg["backend"]
+    # Held on a local so the task lives as long as the supervisor.
+    _bw = (asyncio.create_task(_backlog_watch(load, backend))
+           if BACKLOG_PUSH_S > 0 else None)
     legs: dict[int, asyncio.Task] = {}
     cur_n = 0
     # Startup bootstrap: retry /gw/meta before committing, so leg 0 is created
