@@ -79,10 +79,12 @@ class P:
 
     @staticmethod
     def hello(miner_key, model, model_root, hw=None, capacity=None,
-              worker_name=""):
+              worker_name="", worker_id=None):
         f = {"type": P.HELLO, "miner_key": miner_key, "model": model,
              "model_root": model_root, "hw": hw or {}, "versions": {},
              "capacity": capacity or {}, "worker_name": worker_name}
+        if worker_id:
+            f["worker_id"] = worker_id
         return f
 
     @staticmethod
@@ -219,6 +221,16 @@ def _resolve_miner_key(explicit: str | None) -> str:
     return key
 
 
+def _gpu_uuids() -> list[str]:
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return []
+    return [u.strip() for u in out.splitlines() if u.strip()]
+
+
 def _resolve_worker_name(explicit: str | None, model: str,
                          serve_urls: list[str]) -> str:
     """This machine's worker name under one miner key. Stable across restarts so
@@ -227,6 +239,17 @@ def _resolve_worker_name(explicit: str | None, model: str,
     name = (explicit or _env("ENGY_WORKER_NAME") or _env("ENGY_INSTANCE_ID"))
     if name:
         return name
+    uuids = _gpu_uuids()
+    if uuids:
+        sig = hashlib.sha256(
+            ("gpu:" + ",".join(sorted(uuids))).encode()).hexdigest()[:12]
+        name = f"{model.strip()}@{sig}"
+        slot = _env("ENGY_SLOT")
+        if slot and slot.isdigit() and int(slot) >= 1:
+            name += f"-{int(slot)}"
+        return name
+    print("[tee_miner] WARNING: could not read GPU uuids from nvidia-smi; "
+          "using a host-derived worker name", flush=True)
     seed = "|".join([socket.gethostname(), model, ",".join(serve_urls)])
     return "tee-" + hashlib.sha256(seed.encode()).hexdigest()[:12]
 
@@ -1355,7 +1378,8 @@ async def _session(ws, cfg, cap, load: Load, tag: str,
     load.attach(ws)
     await ws.send(json.dumps(P.hello(
         cfg["miner_key"], cfg["model"], cfg["model_root"], hw=cfg["hw"],
-        capacity=cap, worker_name=cfg["worker_name"])))
+        capacity=cap, worker_name=cfg["worker_name"],
+        worker_id=cfg.get("worker_id"))))
     print(f"[tee_miner] {tag} HELLO sent (max_inflight={cap['max_inflight']})",
           flush=True)
     hb = asyncio.create_task(
@@ -1853,7 +1877,7 @@ def main(argv=None):
     p.add_argument("--worker-name", "--worker_name", dest="worker_name",
                    default=None, help="default $ENGY_WORKER_NAME")
     p.add_argument("--worker-id", "--worker_id", dest="worker_id",
-                   default=None, help=argparse.SUPPRESS)
+                   default=None, help="default $ENGY_WORKER_ID")
     p.add_argument("--serve-url", dest="serve_url",
                    default=_env("ENGY_SERVE_URL", "http://127.0.0.1:8000"),
                    help="local serve base url, comma-separated for several")
@@ -1880,11 +1904,7 @@ def main(argv=None):
     serve_urls = [u.strip() for u in args.serve_url.split(",") if u.strip()]
     worker_name = _resolve_worker_name(args.worker_name, args.model, serve_urls)
 
-    source = ("--worker-id" if args.worker_id
-              else "ENGY_WORKER_ID" if _env("ENGY_WORKER_ID") else None)
-    if source:
-        print(f"[tee_miner] WARNING: worker id from {source} is ignored; "
-              "the gateway assigns it", flush=True)
+    worker_id = args.worker_id or _env("ENGY_WORKER_ID") or None
 
     cap = {"max_inflight": args.max_inflight,
            # Rides undivided past _split_capacity: the gateway routes on the
@@ -1908,6 +1928,7 @@ def main(argv=None):
         "model": args.model,
         "miner_key": miner_key,
         "worker_name": worker_name,
+        "worker_id": worker_id,
         "model_root": _model_root(args.checkpoint),
         "hw": _detect_hw(),
         "backend": Serve(serve_urls, args.served_model, args.read_timeout,
