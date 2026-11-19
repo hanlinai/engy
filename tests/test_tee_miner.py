@@ -1050,3 +1050,91 @@ def test_a_leg_falls_back_to_the_backup_when_the_lb_will_not_open(monkeypatch):
     doors, _ = _run_leg(monkeypatch, connect, spec=f"{LB}|{CF}")
     assert doors[:2] == [LB, LB]
     assert set(doors[2:]) == {CF}
+
+
+# ---- engine prefill backlog (2026-11-19) ----
+
+def _v1(unc, tok, busy_us, ts):
+    return {"loads": [{**SGLANG_V1_LOADS["loads"][0],
+                       "num_waiting_uncached_tokens": unc,
+                       "total_prefill_uncached_tokens": tok,
+                       "total_prefill_busy_us": busy_us, "timestamp": ts}]}
+
+
+def test_v1_loads_carries_backlog_and_measured_rate(monkeypatch):
+    seq = [_v1(15_757, 100_000, 1_000_000, 1.0), _v1(0, 200_000, 7_000_000, 31.0)]
+
+    def handler(request):
+        if request.url.path == "/v1/loads":
+            return tm.httpx.Response(200, json=seq.pop(0))
+        return tm.httpx.Response(404, text="nf")
+    real = tm.httpx.AsyncClient
+    monkeypatch.setattr(tm.httpx, "AsyncClient",
+                        lambda *a, **kw: real(*a, transport=tm.httpx.MockTransport(handler), **kw))
+    s = _kv_serve()
+    kv1 = asyncio.run(s.kv_load())
+    kv2 = asyncio.run(s.kv_load())
+    assert kv1["uncached"] == 15_757 and "pf_tps" not in kv1
+    assert kv2["uncached"] == 0 and kv2["pf_tps"] == 16_666 and kv2["pf_busy"] == 0.2
+    assert kv2["frac"] == 0.92
+
+
+def test_older_v1_loads_has_no_backlog_keys(monkeypatch):
+    _routes(monkeypatch, {"/v1/loads": (200, SGLANG_V1_LOADS)})
+    kv = asyncio.run(_kv_serve().kv_load())
+    assert "uncached" not in kv and "pf_tps" not in kv
+
+
+def test_prefill_fields_rate_is_busy_time_based_and_resets_safely():
+    f, st = tm.prefill_backlog_fields([{"num_waiting_uncached_tokens": 5,
+                                        "total_prefill_uncached_tokens": 0,
+                                        "total_prefill_busy_us": 0,
+                                        "timestamp": 0.0}], None)
+    assert f == {"uncached": 5}
+    f, st = tm.prefill_backlog_fields([{"total_prefill_uncached_tokens": 17_000,
+                                        "total_prefill_busy_us": 1_000_000,
+                                        "timestamp": 10.0}], st)
+    assert f["pf_tps"] == 17_000 and f["pf_busy"] == 0.1
+    f, st = tm.prefill_backlog_fields([{"total_prefill_uncached_tokens": 10,
+                                        "total_prefill_busy_us": 10,
+                                        "timestamp": 20.0}], st)
+    assert "pf_busy" not in f and f["pf_tps"] == 17_000   # restart: no bogus rate
+
+
+def test_backlog_push_decision():
+    assert tm.backlog_moved(None, 0) and not tm.backlog_moved(1, None)
+    assert tm.backlog_moved(0, 1) and tm.backlog_moved(1, 0)
+    assert not tm.backlog_moved(10_000, 15_000, min_tokens=8192)
+    assert tm.backlog_moved(10_000, 30_000, min_tokens=8192)
+
+
+def test_backlog_watch_pushes_to_every_leg(monkeypatch):
+    class WS:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, m):
+            self.sent.append(json.loads(m))
+
+    class B:
+        n = 0
+
+        async def kv_load(self):
+            B.n += 1
+            return {"used": 1, "uncached": 0 if B.n == 1 else 300_000}
+
+    async def go():
+        load = tm.Load()
+        a, b = WS(), WS()
+        load.attach(a), load.attach(b)
+        t = asyncio.create_task(tm._backlog_watch(load, B(), interval=0.01))
+        for _ in range(100):
+            if len(a.sent) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        t.cancel()
+        await asyncio.gather(t, return_exceptions=True)
+        return a, b
+    a, b = asyncio.run(go())
+    assert [f["kv"]["uncached"] for f in a.sent[:2]] == [0, 300_000]
+    assert len(b.sent) >= 2
