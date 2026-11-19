@@ -8,6 +8,9 @@ be working on.
 """
 import asyncio
 import json
+import inspect
+
+import pytest
 
 from miner import tee_miner as tm
 
@@ -1050,3 +1053,95 @@ def test_a_leg_falls_back_to_the_backup_when_the_lb_will_not_open(monkeypatch):
     doors, _ = _run_leg(monkeypatch, connect, spec=f"{LB}|{CF}")
     assert doors[:2] == [LB, LB]
     assert set(doors[2:]) == {CF}
+
+
+# ------------------------------------------------------- name-only identity
+class _AdmitWS:
+    def __init__(self, *frames):
+        self.sent = []
+        self._frames = [json.dumps(f) for f in frames]
+
+    async def send(self, payload):
+        self.sent.append(json.loads(payload))
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._frames:
+            raise StopAsyncIteration
+        return self._frames.pop(0)
+
+
+class _NoBackend:
+    async def kv_load(self):
+        return None
+
+
+def _name_cfg(**kw):
+    return {"miner_key": "k", "model": "m", "model_root": "r", "hw": {},
+            "worker_name": "w1", "backend": _NoBackend(), "hb_s": 1000, **kw}
+
+
+def _run_session(ws, cfg):
+    return asyncio.run(tm._session(ws, cfg, {"max_inflight": 4}, tm.Load(), "gw0"))
+
+
+def test_hello_never_carries_a_worker_id():
+    assert "worker_id" not in tm.P.hello("k", "m", "r", worker_name="w1")
+    assert "worker_id" not in inspect.signature(tm.P.hello).parameters
+
+
+def test_hello_ignores_env_worker_id(monkeypatch):
+    monkeypatch.setenv("ENGY_WORKER_ID", "minted-elsewhere")
+    ws = _AdmitWS({"type": tm.P.ADMIT, "worker_id": "w-1"})
+    _run_session(ws, _name_cfg())
+    hello = ws.sent[0]
+    assert hello["type"] == tm.P.HELLO and "worker_id" not in hello
+    assert hello["worker_name"] == "w1"
+
+
+def test_admit_worker_id_is_printed_once_per_process(monkeypatch, capsys):
+    monkeypatch.setattr(tm, "_worker_id_announced", False)
+    for _ in range(3):
+        _run_session(_AdmitWS({"type": tm.P.ADMIT, "worker_id": "w-1"}), _name_cfg())
+    out = capsys.readouterr().out
+    assert out.count("worker_id=w-1 worker_name=w1") == 1
+
+
+def test_admit_without_worker_id_prints_unknown(monkeypatch, capsys):
+    monkeypatch.setattr(tm, "_worker_id_announced", False)
+    _run_session(_AdmitWS({"type": tm.P.ADMIT}), _name_cfg())
+    assert "worker_id=unknown worker_name=w1" in capsys.readouterr().out
+
+
+def test_require_tee_identity_exits_on_admit_without_worker_id(monkeypatch):
+    monkeypatch.setattr(tm, "_worker_id_announced", False)
+    with pytest.raises(SystemExit) as e:
+        _run_session(_AdmitWS({"type": tm.P.ADMIT}),
+                     _name_cfg(require_tee_identity=True))
+    assert e.value.code not in (0, None)
+
+
+def test_require_tee_identity_serves_when_admit_has_worker_id(monkeypatch):
+    monkeypatch.setattr(tm, "_worker_id_announced", False)
+    _run_session(_AdmitWS({"type": tm.P.ADMIT, "worker_id": "w-1"}),
+                 _name_cfg(require_tee_identity=True))
+
+
+def test_main_ignores_env_worker_id_with_one_warning(monkeypatch, capsys):
+    async def stop(cfg, cap, load):
+        assert "worker_id" not in cfg
+    monkeypatch.setattr(tm, "_supervise", stop)
+    monkeypatch.setattr(tm, "_detect_hw", lambda: {})
+    monkeypatch.setenv("ENGY_MINER_KEY", "k")
+    monkeypatch.setenv("ENGY_WORKER_ID", "x")
+    monkeypatch.setenv("ENGY_WORKER_NAME", "w1")
+    tm.main([])
+    out = capsys.readouterr().out
+    assert out.count("ENGY_WORKER_ID is ignored") == 1
+
+
+def test_door_seeding_is_stable_for_the_same_worker_name():
+    a = tm.Doors.parse(tm.DEFAULT_GW, seed="w1").homes(8)
+    assert a == tm.Doors.parse(tm.DEFAULT_GW, seed="w1").homes(8)

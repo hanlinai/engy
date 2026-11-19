@@ -5,13 +5,10 @@ the gateway routes to it, streams the generation from a local OpenAI-compatible
 serve (sglang / vLLM) back over the same connection.
 
 What makes this the *TEE* miner rather than the general one is identity. A TEE
-worker does not invent who it is: the provisioning step ("declare") allocates a
-`worker_provisioning` row and bakes the assigned ids into the confidential VM's
-environment. This miner adopts them, so the `workers` row it registers lines up
-with the row the provider declared, which is what lets activation flip that row
-to `type='tee'`. A miner that mints its own uuid here registers a worker nobody
-declared, activation has nothing to match, and the worker silently never becomes
-a TEE worker.
+worker is named by the provisioning step ("declare"), which bakes the worker
+name into the confidential VM's environment. The miner HELLOs with that name
+only; the gateway resolves it to the provider-seeded worker and reports the
+worker id back in ADMIT, which is printed once at startup.
 
   gateway ──(N websocket legs, one per gateway worker)──► tee_miner
                                                              │  stream from the local serve
@@ -20,8 +17,6 @@ a TEE worker.
 Identity, read from the environment automatically:
 
   ENGY_MINER_KEY    the operator key this worker registers under (required)
-  ENGY_WORKER_ID    provider-assigned, from declare. MUST match the
-                    worker_provisioning row or activation cannot flip it
   ENGY_WORKER_NAME  this machine's name among the workers sharing one key
 
 Configuration:
@@ -90,12 +85,10 @@ class P:
 
     @staticmethod
     def hello(miner_key, model, model_root, hw=None, capacity=None,
-              worker_name="", worker_id=""):
+              worker_name=""):
         f = {"type": P.HELLO, "miner_key": miner_key, "model": model,
              "model_root": model_root, "hw": hw or {}, "versions": {},
              "capacity": capacity or {}, "worker_name": worker_name}
-        if worker_id:
-            f["worker_id"] = worker_id
         return f
 
     @staticmethod
@@ -230,21 +223,6 @@ def _resolve_miner_key(explicit: str | None) -> str:
                  "--miner-key). On a provisioned TEE worker this is injected "
                  "into the VM environment.")
     return key
-
-
-def _resolve_worker_id(explicit: str | None) -> tuple[str, bool]:
-    """The worker_id this process HELLOs with.
-
-    A TEE worker adopts the PROVIDER-ASSIGNED id (explicit arg, else
-    ENGY_WORKER_ID injected at declare) so its `workers` row matches its
-    `worker_provisioning` row. Falling back to a minted uuid keeps the miner
-    serving, but it will never be activated as a TEE worker, so the caller is
-    told which of the two happened.
-    """
-    wid = explicit or _env("ENGY_WORKER_ID")
-    if wid:
-        return wid, True
-    return uuid.uuid4().hex, False
 
 
 def _resolve_worker_name(explicit: str | None, model: str,
@@ -1362,6 +1340,18 @@ class _LegRotation:
             pass
 
 
+_worker_id_announced = False
+
+
+def _announce_worker_id(worker_id, worker_name) -> None:
+    global _worker_id_announced
+    if _worker_id_announced:
+        return
+    _worker_id_announced = True
+    print(f"[tee_miner] worker_id={worker_id or 'unknown'} "
+          f"worker_name={worker_name}", flush=True)
+
+
 async def _session(ws, cfg, cap, load: Load, tag: str,
                    rotate_after: float | None = None) -> bool:
     """One leg. Returns True if the gateway asked us to rotate (RECONNECT), in
@@ -1371,8 +1361,7 @@ async def _session(ws, cfg, cap, load: Load, tag: str,
     load.attach(ws)
     await ws.send(json.dumps(P.hello(
         cfg["miner_key"], cfg["model"], cfg["model_root"], hw=cfg["hw"],
-        capacity=cap, worker_name=cfg["worker_name"],
-        worker_id=cfg["worker_id"])))
+        capacity=cap, worker_name=cfg["worker_name"])))
     print(f"[tee_miner] {tag} HELLO sent (max_inflight={cap['max_inflight']})",
           flush=True)
     hb = asyncio.create_task(
@@ -1419,6 +1408,12 @@ async def _session(ws, cfg, cap, load: Load, tag: str,
                 break
             elif t == P.ADMIT:
                 print(f"[tee_miner] {tag} ADMITTED", flush=True)
+                wid = frame.get("worker_id")
+                if not wid and cfg.get("require_tee_identity"):
+                    sys.exit("tee_miner: the gateway ADMITTed this worker "
+                             "without a worker_id and ENGY_REQUIRE_TEE_IDENTITY "
+                             "is set; refusing to serve unidentified.")
+                _announce_worker_id(wid, cfg["worker_name"])
             elif t == P.DENY:
                 print(f"[tee_miner] {tag} DENIED: {frame.get('reason')}",
                       flush=True)
@@ -1865,10 +1860,6 @@ def main(argv=None):
     p.add_argument("--model", default=_env("ENGY_MODEL", "glm-5.2"))
     p.add_argument("--miner-key", "--miner_key", dest="miner_key", default=None,
                    help="default $ENGY_MINER_KEY, injected on a TEE worker")
-    p.add_argument("--worker-id", "--worker_id", dest="worker_id", default=None,
-                   help="provider-assigned worker_id from declare; default "
-                        "$ENGY_WORKER_ID. Must match the worker_provisioning "
-                        "row or the worker cannot be activated as TEE")
     p.add_argument("--worker-name", "--worker_name", dest="worker_name",
                    default=None, help="default $ENGY_WORKER_NAME")
     p.add_argument("--serve-url", dest="serve_url",
@@ -1893,23 +1884,17 @@ def main(argv=None):
                         "of matching on the model id")
     p.add_argument("--require-tee-identity", action="store_true",
                    default=_env("ENGY_REQUIRE_TEE_IDENTITY") == "1",
-                   help="exit rather than serve without a provider-assigned "
-                        "ENGY_WORKER_ID")
+                   help="exit if the gateway ADMITs this worker without a "
+                        "worker_id")
     args = p.parse_args(argv)
 
     miner_key = _resolve_miner_key(args.miner_key)
-    worker_id, assigned = _resolve_worker_id(args.worker_id)
     serve_urls = [u.strip() for u in args.serve_url.split(",") if u.strip()]
     worker_name = _resolve_worker_name(args.worker_name, args.model, serve_urls)
 
-    if not assigned:
-        msg = ("tee_miner: ENGY_WORKER_ID is not set, so this process minted "
-               f"{worker_id}. It will serve, but it registers a worker no "
-               "provisioning row declared, so activation cannot flip it to "
-               "type='tee'.")
-        if args.require_tee_identity:
-            sys.exit(msg.replace("It will serve, but it", "Refusing to start: it"))
-        print("[tee_miner] WARNING: " + msg, flush=True)
+    if _env("ENGY_WORKER_ID"):
+        print("[tee_miner] WARNING: ENGY_WORKER_ID is ignored; the worker id "
+              "is assigned by engy and reported by the gateway.", flush=True)
 
     cap = {"max_inflight": args.max_inflight,
            # Rides undivided past _split_capacity: the gateway routes on the
@@ -1927,13 +1912,13 @@ def main(argv=None):
 
     cfg = {
         "gw": args.gw,
-        # Seeded by worker id: the same legs take the same doors after a
+        # Seeded by worker name: the same legs take the same doors after a
         # restart, while different workers spread differently.
-        "doors": Doors.parse(args.gw, seed=worker_id),
+        "doors": Doors.parse(args.gw, seed=worker_name),
         "model": args.model,
         "miner_key": miner_key,
-        "worker_id": worker_id,
         "worker_name": worker_name,
+        "require_tee_identity": args.require_tee_identity,
         "model_root": _model_root(args.checkpoint),
         "hw": _detect_hw(),
         "backend": Serve(serve_urls, args.served_model, args.read_timeout,
@@ -1948,8 +1933,7 @@ def main(argv=None):
     load = Load()
     print(f"[tee_miner] supervising legs via "
           f"{', '.join(_host(u) for u in cfg['doors'].urls)} as {cfg['model']} "
-          f"worker={worker_name} worker_id={worker_id}"
-          f"{'' if assigned else ' (MINTED, not provider-assigned)'} "
+          f"worker={worker_name} "
           f"root={cfg['model_root'][:12]} serves={serve_urls} "
           f"total_inflight={cap['max_inflight']} "
           f"modalities={mods or ['text']}", flush=True)
