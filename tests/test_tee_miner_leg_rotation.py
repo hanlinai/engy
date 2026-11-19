@@ -60,7 +60,7 @@ class SlowBackend:
 
 def _cfg(backend):
     return {"miner_key": "k", "model": "kimi-k3", "model_root": "r", "hw": {},
-            "worker_name": "w", "worker_id": "wid", "backend": backend,
+            "worker_name": "w", "backend": backend,
             "hb_s": 1000}
 
 

@@ -8,6 +8,10 @@ be working on.
 """
 import asyncio
 import json
+import types
+import inspect
+
+import pytest
 
 from miner import tee_miner as tm
 
@@ -1050,3 +1054,169 @@ def test_a_leg_falls_back_to_the_backup_when_the_lb_will_not_open(monkeypatch):
     doors, _ = _run_leg(monkeypatch, connect, spec=f"{LB}|{CF}")
     assert doors[:2] == [LB, LB]
     assert set(doors[2:]) == {CF}
+
+
+# ------------------------------------------------------- name-only identity
+class _AdmitWS:
+    def __init__(self, *frames):
+        self.sent = []
+        self._frames = [json.dumps(f) for f in frames]
+
+    async def send(self, payload):
+        self.sent.append(json.loads(payload))
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._frames:
+            raise StopAsyncIteration
+        return self._frames.pop(0)
+
+
+class _NoBackend:
+    async def kv_load(self):
+        return None
+
+
+def _name_cfg(**kw):
+    return {"miner_key": "k", "model": "m", "model_root": "r", "hw": {},
+            "worker_name": "w1", "backend": _NoBackend(), "hb_s": 1000, **kw}
+
+
+def _run_session(ws, cfg):
+    return asyncio.run(tm._session(ws, cfg, {"max_inflight": 4}, tm.Load(), "gw0"))
+
+
+def test_hello_carries_a_provided_worker_id():
+    assert tm.P.hello("k", "m", "r", worker_name="w1",
+                      worker_id="w-9")["worker_id"] == "w-9"
+
+
+def test_hello_without_worker_id_has_only_the_name():
+    hello = tm.P.hello("k", "m", "r", worker_name="w1")
+    assert "worker_id" not in hello and hello["worker_name"] == "w1"
+
+
+def test_session_hello_carries_cfg_worker_id():
+    ws = _AdmitWS({"type": tm.P.ADMIT, "worker_id": "w-1"})
+    _run_session(ws, _name_cfg(worker_id="w-9"))
+    assert ws.sent[0]["worker_id"] == "w-9" and ws.sent[0]["worker_name"] == "w1"
+
+
+def test_session_hello_without_cfg_worker_id_omits_it():
+    ws = _AdmitWS({"type": tm.P.ADMIT})
+    _run_session(ws, _name_cfg())
+    assert "worker_id" not in ws.sent[0]
+
+
+def test_admit_worker_id_is_printed_once_per_process(monkeypatch, capsys):
+    monkeypatch.setattr(tm, "_worker_id_announced", False)
+    for _ in range(3):
+        _run_session(_AdmitWS({"type": tm.P.ADMIT, "worker_id": "w-1"}), _name_cfg())
+    out = capsys.readouterr().out
+    assert out.count("worker_id=w-1 worker_name=w1") == 1
+
+
+def test_admit_without_worker_id_prints_unknown(monkeypatch, capsys):
+    monkeypatch.setattr(tm, "_worker_id_announced", False)
+    _run_session(_AdmitWS({"type": tm.P.ADMIT}), _name_cfg())
+    assert "worker_id=unknown worker_name=w1" in capsys.readouterr().out
+
+
+def _main_cfg(monkeypatch, argv):
+    seen = []
+
+    async def stop(cfg, cap, load):
+        seen.append(cfg)
+    monkeypatch.setattr(tm, "_supervise", stop)
+    monkeypatch.setattr(tm, "_detect_hw", lambda: {})
+    monkeypatch.setenv("ENGY_MINER_KEY", "k")
+    monkeypatch.setenv("ENGY_WORKER_NAME", "w1")
+    tm.main(argv)
+    return seen[0]
+
+
+@pytest.mark.parametrize("argv", [["--worker-id", "x"], ["--worker-id=x"],
+                                  ["--worker_id", "x"]])
+def test_main_uses_worker_id_flag(monkeypatch, argv):
+    monkeypatch.delenv("ENGY_WORKER_ID", raising=False)
+    cfg = _main_cfg(monkeypatch, argv)
+    assert cfg["worker_id"] == "x" and cfg["worker_name"] == "w1"
+
+
+def test_main_uses_worker_id_env(monkeypatch):
+    monkeypatch.setenv("ENGY_WORKER_ID", "e")
+    assert _main_cfg(monkeypatch, [])["worker_id"] == "e"
+
+
+def test_main_flag_beats_env_worker_id(monkeypatch):
+    monkeypatch.setenv("ENGY_WORKER_ID", "e")
+    assert _main_cfg(monkeypatch, ["--worker-id", "x"])["worker_id"] == "x"
+
+
+def test_main_without_worker_id_mints_none(monkeypatch):
+    monkeypatch.delenv("ENGY_WORKER_ID", raising=False)
+    cfg = _main_cfg(monkeypatch, [])
+    assert not cfg.get("worker_id")
+
+
+# ------------------------------------------------------- default worker name
+GPU_UUIDS = ["GPU-7c1e0a52-9f3d-4b8e-a1c2-000000000002",
+             "GPU-7c1e0a52-9f3d-4b8e-a1c2-000000000001"]
+SIG12 = "097f2c051f8f"
+
+
+def _smi(monkeypatch, uuids=GPU_UUIDS, fail=False):
+    def run(cmd, **kw):
+        if fail:
+            raise FileNotFoundError("nvidia-smi")
+        assert cmd[0] == "nvidia-smi" and "--query-gpu=uuid" in cmd
+        return types.SimpleNamespace(stdout="\n".join(uuids) + "\n", returncode=0)
+    monkeypatch.setattr(tm.subprocess, "run", run)
+
+
+@pytest.fixture
+def _noname(monkeypatch):
+    for k in ("ENGY_WORKER_NAME", "ENGY_INSTANCE_ID", "ENGY_SLOT"):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_default_name_is_model_at_hardware_sig(monkeypatch, _noname):
+    _smi(monkeypatch)
+    assert tm._resolve_worker_name(None, "kimi-k3", []) == f"kimi-k3@{SIG12}"
+    assert tm._resolve_worker_name(None, " kimi-k3 ", []) == f"kimi-k3@{SIG12}"
+
+
+@pytest.mark.parametrize("slot,suffix", [("1", "-1"), ("2", "-2"), ("0", ""),
+                                         ("", "")])
+def test_default_name_slot_suffix(monkeypatch, _noname, slot, suffix):
+    _smi(monkeypatch)
+    monkeypatch.setenv("ENGY_SLOT", slot)
+    assert tm._resolve_worker_name(None, "kimi-k3", []) == \
+        f"kimi-k3@{SIG12}{suffix}"
+
+
+def test_explicit_name_wins_over_default(monkeypatch, _noname):
+    _smi(monkeypatch)
+    monkeypatch.setenv("ENGY_SLOT", "1")
+    assert tm._resolve_worker_name("mine", "kimi-k3", []) == "mine"
+    monkeypatch.setenv("ENGY_WORKER_NAME", "envname")
+    assert tm._resolve_worker_name(None, "kimi-k3", []) == "envname"
+
+
+def test_default_name_falls_back_with_one_warning(monkeypatch, _noname, capsys):
+    _smi(monkeypatch, fail=True)
+    name = tm._resolve_worker_name(None, "kimi-k3", ["http://x"])
+    assert name.startswith("tee-") and len(name) == 16
+    assert capsys.readouterr().out.count("WARNING") == 1
+
+
+def test_default_name_falls_back_on_empty_uuid_list(monkeypatch, _noname):
+    _smi(monkeypatch, uuids=[])
+    assert tm._resolve_worker_name(None, "kimi-k3", []).startswith("tee-")
+
+
+def test_door_seeding_is_stable_for_the_same_worker_name():
+    a = tm.Doors.parse(tm.DEFAULT_GW, seed="w1").homes(8)
+    assert a == tm.Doors.parse(tm.DEFAULT_GW, seed="w1").homes(8)
