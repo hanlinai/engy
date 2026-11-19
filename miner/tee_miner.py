@@ -348,7 +348,9 @@ def _model_root(checkpoint: str) -> str:
 #   pf_tps    prefill tok/s WHILE prefilling, from the cumulative
 #             `total_prefill_uncached_tokens` / `total_prefill_busy_us`
 #             counters between two samples (EWMA, >= PF_MIN_BUSY_S busy);
-#   pf_busy   share of wall time spent prefilling since the last sample.
+#   pf_busy   prefill busy share as sglang counts it (only back-to-back prefill
+#             steps add time, so with --prefill-decode-interval 1 it
+#             UNDER-reads: a lower bound, display only; pf_tps is unaffected).
 # The gateway (engy-core registry knobs prefill_engine_backlog /
 # prefill_load_s) turns these into a backlog in seconds and routes on it.
 # Mirror of engy-core `engy.refminer.prefill_backlog_fields`; keep in sync.
