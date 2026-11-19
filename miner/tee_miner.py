@@ -4,12 +4,6 @@ A single self-contained module. It dials the engy gateway, and for every request
 the gateway routes to it, streams the generation from a local OpenAI-compatible
 serve (sglang / vLLM) back over the same connection.
 
-What makes this the *TEE* miner rather than the general one is identity. A TEE
-worker is named by the provisioning step ("declare"), which bakes the worker
-name into the confidential VM's environment. The miner HELLOs with that name
-only; the gateway resolves it to the provider-seeded worker and reports the
-worker id back in ADMIT, which is printed once at startup.
-
   gateway ──(N websocket legs, one per gateway worker)──► tee_miner
                                                              │  stream from the local serve
                                                              └► chunk… chunk… response
@@ -1858,6 +1852,8 @@ def main(argv=None):
                    help="default $ENGY_MINER_KEY, injected on a TEE worker")
     p.add_argument("--worker-name", "--worker_name", dest="worker_name",
                    default=None, help="default $ENGY_WORKER_NAME")
+    p.add_argument("--worker-id", "--worker_id", dest="worker_id",
+                   default=None, help=argparse.SUPPRESS)
     p.add_argument("--serve-url", dest="serve_url",
                    default=_env("ENGY_SERVE_URL", "http://127.0.0.1:8000"),
                    help="local serve base url, comma-separated for several")
@@ -1884,9 +1880,11 @@ def main(argv=None):
     serve_urls = [u.strip() for u in args.serve_url.split(",") if u.strip()]
     worker_name = _resolve_worker_name(args.worker_name, args.model, serve_urls)
 
-    if _env("ENGY_WORKER_ID"):
-        print("[tee_miner] WARNING: ENGY_WORKER_ID is ignored; the worker id "
-              "is assigned by engy and reported by the gateway.", flush=True)
+    source = ("--worker-id" if args.worker_id
+              else "ENGY_WORKER_ID" if _env("ENGY_WORKER_ID") else None)
+    if source:
+        print(f"[tee_miner] WARNING: worker id from {source} is ignored; "
+              "the gateway assigns it", flush=True)
 
     cap = {"max_inflight": args.max_inflight,
            # Rides undivided past _split_capacity: the gateway routes on the

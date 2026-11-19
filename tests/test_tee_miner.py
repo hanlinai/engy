@@ -1125,7 +1125,38 @@ def test_main_ignores_env_worker_id_with_one_warning(monkeypatch, capsys):
     monkeypatch.setenv("ENGY_WORKER_NAME", "w1")
     tm.main([])
     out = capsys.readouterr().out
-    assert out.count("ENGY_WORKER_ID is ignored") == 1
+    assert out.count(
+        "worker id from ENGY_WORKER_ID is ignored; the gateway assigns it") == 1
+
+
+def _main_cfg(monkeypatch, argv):
+    seen = []
+
+    async def stop(cfg, cap, load):
+        seen.append(cfg)
+    monkeypatch.setattr(tm, "_supervise", stop)
+    monkeypatch.setattr(tm, "_detect_hw", lambda: {})
+    monkeypatch.setenv("ENGY_MINER_KEY", "k")
+    monkeypatch.setenv("ENGY_WORKER_NAME", "w1")
+    tm.main(argv)
+    return seen[0]
+
+
+@pytest.mark.parametrize("argv", [["--worker-id", "x"], ["--worker-id=x"],
+                                  ["--worker_id", "x"]])
+def test_main_accepts_and_ignores_worker_id_flag(monkeypatch, capsys, argv):
+    monkeypatch.delenv("ENGY_WORKER_ID", raising=False)
+    cfg = _main_cfg(monkeypatch, argv)
+    out = capsys.readouterr().out
+    assert "worker_id" not in cfg and cfg["worker_name"] == "w1"
+    assert out.count(
+        "worker id from --worker-id is ignored; the gateway assigns it") == 1
+
+
+def test_main_flag_and_env_worker_id_warn_once(monkeypatch, capsys):
+    monkeypatch.setenv("ENGY_WORKER_ID", "y")
+    _main_cfg(monkeypatch, ["--worker-id", "x"])
+    assert capsys.readouterr().out.count("is ignored; the gateway assigns it") == 1
 
 
 def test_door_seeding_is_stable_for_the_same_worker_name():
