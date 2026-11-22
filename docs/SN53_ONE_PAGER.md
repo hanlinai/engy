@@ -185,12 +185,11 @@ what stays fixed.
   hardware is read by engy itself during onboarding (GPU class, count and
   memory, GPU IDs not claimed by another server, model-disk size), not taken
   from the server's own report, and it is re-checked on every sample.
-- **Sub-pools.** The pool is split into one sub-pool per class, in proportion
-  to **how many servers of that class we want × its base price**, the base
-  price reflecting what one such server costs to rent. Each sub-pool is divided
-  among its own servers only, so one class never dilutes another, and it is
-  **always paid out in full**: fewer servers than the target means a larger
-  share each. An empty sub-pool burns its share. The split is frozen into each
+- **Sub-pools.** The pool is split into one sub-pool per class, each with a
+  **share of the pool that we set**. Each sub-pool is divided among its own
+  servers only, so one class never dilutes another, and it is **always paid out
+  in full**: fewer servers means a larger share each. An empty sub-pool burns
+  its share. The split is frozen into each
   epoch's signed params, so an adjustment applies from the next epoch on.
 - **Counting starts when it really serves.** Enrolment alone earns nothing.
   A server starts counting at its first sample in which a worker has deployed
@@ -230,10 +229,10 @@ what stays fixed.
 For the current period the classes are **B300 and B200, split 70 / 30**, with a
 **5-day** vesting period. Both apply from **epoch 23**:
 
-| Class | Server | Model disk | Base price | Share of pool | Share of all emission |
-|---|---|---|---|---|---|
-| B300 | standard 8x B300 | ≥ 2 TB | 200 | **70%** | 56% |
-| B200 | standard 8x B200 | ≥ 1 TB | 100 | **30%** | 24% |
+| Class | Server | Model disk | Share of pool | Share of all emission |
+|---|---|---|---|---|
+| B300 | standard 8x B300 | ≥ 2 TB | **70%** | 56% |
+| B200 | standard 8x B200 | ≥ 1 TB | **30%** | 24% |
 
 B300 is the larger class because we want more capacity for the largest models;
 B200 stays as the cost-effective server for the high-volume flash models. When
