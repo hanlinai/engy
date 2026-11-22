@@ -150,7 +150,7 @@ Each epoch's 65535 weight budget is split in two, each normalized on its own:
 | Share | Budget | Who earns it | Paid for |
 |---|---|---|---|
 | **80%, baseline pool** | 52428 | enrolled servers in the current **hardware classes** | being online and serving whatever model we assign |
-| **20%, traffic** | 13107 | every bound, unbanned miner | paid buyer traffic that passes the four gates |
+| **20%, traffic** | 13107 | every bound, unbanned miner, per **model sub-pool** | paid buyer traffic that passes the four gates |
 
 ### Baseline pool (80%): the mechanism
 
@@ -263,14 +263,44 @@ score     = floor( Σ tokens(r) · score_rate[model] / 1000 )   if every gate pa
   and never entered scoring at all, so miner-attributable failure is exactly
   **502** and **504**.
 
-**Score to weight (`weight_u16`).** Each budget is normalized separately: a
-row's share of its budget is `score ÷ Σ score`, with the rounding remainder
-going to that budget's top row. A miner's on-chain weight is the sum of its
-pool and traffic rows. Cross-model comparability inside the traffic budget comes
-from `score_rate`.
+**Model sub-pools.** From a cutover epoch announced in advance
+(`ENGY_SN53_TRAFFIC_SUBPOOL_START_INDEX`), the traffic budget is no longer one
+pool shared by every model. It is split into **one sub-pool per top-5 model plus
+one shared `others` sub-pool**, so a model's share of emission is fixed for the
+epoch and a demand spike on one model never dilutes the providers of another:
 
-**Burn.** A budget with nothing to pay (no enrolled server online, or no
-scoring traffic) goes to the owner hotkey; the other budget is unaffected.
+- **Basis.** Each sub-pool's share is that model's share of **buyer spend**
+  (what buyers were actually billed, internal and probe accounts excluded) over
+  the **30 whole UTC days before the epoch starts**. The five models with the
+  most spend get their own sub-pool; every other scored model shares `others`.
+- **Frozen at open.** The shares (and the spend they came from) are computed
+  once, when the epoch opens, and frozen into that epoch's signed `params_json`
+  (`traffic_model_shares`). Traffic during the epoch cannot move them.
+- **Inside a sub-pool** rows split by `score` exactly as described below; a
+  model enabled after the epoch opened is scored in `others`.
+- **Empty sub-pool burns.** A sub-pool with no scoring row (no miner, or every
+  miner gated out) burns its share to the owner hotkey; it is never moved to
+  another model.
+- **Public.** The live split (baseline classes and traffic sub-pools, paid and
+  burned) is on the provider site's **Network → Allocation** page.
+
+Example (shares the next epoch would get from the 30 days to 2026-11-25): of the
+20% traffic budget, kimi-k3.1-pro 35.8%, kimi-k3 31.1%, deepseek-v4.1-flash
+16.3%, glm-5.2 9.0%, glm-5.3 5.2%, others 2.5%. The real numbers are whatever
+is frozen into each epoch's params.
+
+**Score to weight (`weight_u16`).** Each budget (and, after the cutover, each
+traffic sub-pool) is normalized separately: a row's share of its budget is
+`score ÷ Σ score`, with the rounding remainder going to that budget's top row.
+A sub-pool's budget is `traffic_budget · share // 10^6`, its remainder going to
+the largest share. A miner's on-chain weight is the sum of its pool and traffic
+rows. Before the cutover, cross-model comparability inside the traffic budget
+comes from `score_rate`; after it, each model competes only within its own
+sub-pool.
+
+**Burn.** A budget with nothing to pay (no enrolled server online, no scoring
+traffic, or an empty traffic sub-pool) goes to the owner hotkey; the others are
+unaffected.
 
 **Emission.** The weight vector applied under Yuma consensus. A fresh key starts
 at zero (registration churn is unprofitable); a miner that trips a traffic gate
