@@ -150,7 +150,7 @@ Each epoch's 65535 weight budget is split in two, each normalized on its own:
 | Share | Budget | Who earns it | Paid for |
 |---|---|---|---|
 | **80%, baseline pool** | 52428 | enrolled servers in the current **hardware classes** | being online and serving whatever model we assign |
-| **20%, traffic** | 13107 | every bound, unbanned miner, per **model sub-pool** | paid buyer traffic that passes the four gates |
+| **20%, traffic** | 13107 | every bound, unbanned miner, per **model sub-pool** | paid buyer traffic that passes the gates |
 
 ### Baseline pool (80%): the mechanism
 
@@ -230,35 +230,37 @@ unchanged, and is open to every miner, enrolled or not.
 **Traffic score, per (miner, model):**
 
 ```
-tokens(r) = prompt_tokens + completion_tokens
-score     = floor( Σ tokens(r) · score_rate[model] / 1000 )   if every gate passes
-          = 0                                                 otherwise
+W     = floor( uncached_input · input_rate / 1000 )
+      + floor( cached         · cache_rate / 1000 )
+      + floor( output         · output_rate / 1000 )      summed over counted requests
+score = W   if every gate passes
+      = 0   otherwise
 ```
 
 - **Counted requests.** HTTP 2xx **and** `cost_micro > 0`. Only traffic somebody
   actually paid for scores; free-tier, internal, and probe traffic cannot mint
   weight. This is the **anti-wash-trading** mechanism.
-- **`score_rate[model]`.** A per-model blended µUSD-per-1k-tokens rate **we set**,
-  deliberately *not* the buyer-facing price card. It makes models comparable on
-  one axis, it is the direct lever for steering capacity toward a model, and it is
-  immune to buyer discounting: two miners doing identical work score identically
-  even if one served a discounted account.
-- **Gates.** Four, each a ratio with a threshold and **its own minimum sample,
-  below which it passes**. Evaluated in fixed order; the first failure is recorded
-  in `gate_reason`:
+- **Rates.** Input, cache-hit and output tokens are priced separately at the
+  model's **list price** (µUSD per 1k tokens, frozen into each epoch's params),
+  not at what a given buyer paid: two miners doing identical work score
+  identically even if one served a discounted account. A model with no cache
+  price prices cache hits at its input rate. (Epochs before 11 used one blended
+  rate for all tokens.)
+- **Gates.** Three, each with a threshold and **its own minimum sample, below
+  which it passes**. Evaluated in fixed order; the first failure is recorded in
+  `gate_reason`:
 
   | Gate | Grain | Fails when |
   |---|---|---|
-  | Acceptance | (miner, model) | 2xx rate `< 99%` |
+  | Acceptance | (miner, model) | 2xx rate `< 95%` (prod) |
   | TTFT p99 | (miner, model) | over the model's `qual_ttft_p99_ms` |
   | TPOT p99 | (miner, model) | over the model's `qual_tpot_p99_ms` |
-  | Cheat | miner | `cheat` verdicts `> 1%` of rendered verdicts |
 
-  Thresholds are inherited verbatim from the qualifier's unified 1% standard, not
-  re-derived. **`unproven` is counted but never gates**: a verdict must
-  affirmatively establish misbehaviour before it costs a miner anything, and an
-  unusable proof has honest causes. **Scoring never bans**; a failing miner loses
-  the epoch and starts clean in the next one. HTTP 499 (buyer hung up) leaves the
+  The former cheat gate was retired together with the verdict pipeline: no
+  request is sampled for audit today, so there is no cheat signal in scoring.
+  Thresholds are frozen into each epoch's signed params. **Scoring never bans**;
+  a failing miner loses that row's traffic weight for the epoch (pool share is
+  unaffected) and starts clean in the next one. HTTP 499 (buyer hung up) leaves the
   acceptance denominator; every *other* 4xx is emitted before a miner is picked
   and never entered scoring at all, so miner-attributable failure is exactly
   **502** and **504**.
@@ -295,7 +297,7 @@ traffic sub-pool) is normalized separately: a row's share of its budget is
 A sub-pool's budget is `traffic_budget · share // 10^6`, its remainder going to
 the largest share. A miner's on-chain weight is the sum of its pool and traffic
 rows. Before the cutover, cross-model comparability inside the traffic budget
-comes from `score_rate`; after it, each model competes only within its own
+comes from pricing every model at its list price; after it, each model competes only within its own
 sub-pool.
 
 **Burn.** A budget with nothing to pay (no enrolled server online, no scoring
