@@ -1220,3 +1220,71 @@ def test_default_name_falls_back_on_empty_uuid_list(monkeypatch, _noname):
 def test_door_seeding_is_stable_for_the_same_worker_name():
     a = tm.Doors.parse(tm.DEFAULT_GW, seed="w1").homes(8)
     assert a == tm.Doors.parse(tm.DEFAULT_GW, seed="w1").homes(8)
+
+
+# ---- engines behind a front (PD: sgl-router) ----
+
+def _host_routes(monkeypatch, routes):
+    """{(host, path): (status, body)}; a missing host -> connection refused."""
+    def handler(request):
+        key = (request.url.host + ":" + str(request.url.port), request.url.path)
+        hosts = {h for h, _ in routes}
+        if key[0] not in hosts:
+            raise tm.httpx.ConnectError("refused", request=request)
+        status, body = routes.get(key, (404, "not found"))
+        if isinstance(body, str):
+            return tm.httpx.Response(status, text=body)
+        return tm.httpx.Response(status, json=body)
+    real = tm.httpx.AsyncClient
+    monkeypatch.setattr(tm.httpx, "AsyncClient",
+                        lambda *a, **kw: real(*a, transport=tm.httpx.MockTransport(handler), **kw))
+
+
+RTR, PRE, DEC = "127.0.0.1:30000", "10.0.0.1:8000", "127.0.0.1:8000"
+
+
+def _pd_serve():
+    return tm.Serve([f"http://{RTR}"], "/model", 60.0,
+                    health_urls=[f"http://{PRE}", f"http://{DEC}"],
+                    load_urls=[f"http://{DEC}", f"http://{PRE}"])
+
+
+def test_pd_probe_ok_only_when_router_and_every_engine_are_healthy(monkeypatch):
+    ok = {(h, "/health"): (200, "") for h in (RTR, PRE, DEC)}
+    _host_routes(monkeypatch, ok)
+    assert asyncio.run(_pd_serve().probe()) == "ok"
+
+
+def test_pd_probe_dead_engine_behind_an_always_200_router_is_dead(monkeypatch):
+    # sgl-router answers /health 200 whatever its engines do; the prefill
+    # engine is gone. A plain multi-serve would say "ok" (another serve can take
+    # work); behind a router every engine is required.
+    _host_routes(monkeypatch, {(RTR, "/health"): (200, ""), (DEC, "/health"): (200, "")})
+    s = _pd_serve()
+    assert asyncio.run(s.probe()) == "dead"
+    assert s._down == set()          # the router itself stays routable
+
+
+def test_pd_probe_unhealthy_engine_is_dead(monkeypatch):
+    _host_routes(monkeypatch, {(RTR, "/health"): (200, ""), (PRE, "/health"): (503, ""),
+                               (DEC, "/health"): (200, "")})
+    assert asyncio.run(_pd_serve().probe()) == "dead"
+
+
+def test_pd_probe_router_down_is_dead(monkeypatch):
+    _host_routes(monkeypatch, {(PRE, "/health"): (200, ""), (DEC, "/health"): (200, "")})
+    assert asyncio.run(_pd_serve().probe()) == "dead"
+
+
+def test_pd_kv_load_reads_the_engines_not_the_router(monkeypatch):
+    v1 = SGLANG_V1_LOADS
+    _host_routes(monkeypatch, {(RTR, "/v1/loads"): (501, "nope"),
+                               (DEC, "/v1/loads"): (200, v1), (PRE, "/v1/loads"): (200, v1)})
+    kv = asyncio.run(_pd_serve().kv_load())
+    one = asyncio.run(tm.Serve([f"http://{DEC}"], "/model", 60.0).kv_load())
+    assert kv["ranks"] == 2 * one["ranks"] and kv["limit"] == 2 * one["limit"]
+
+
+def test_plain_serve_unchanged_without_health_or_load_urls():
+    s = tm.Serve(["http://a:1", "http://b:2"], "/m", 60.0)
+    assert s.health_urls == [] and s.load_urls == ["http://a:1", "http://b:2"]
