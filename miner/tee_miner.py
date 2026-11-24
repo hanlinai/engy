@@ -343,9 +343,16 @@ def _model_root(checkpoint: str) -> str:
 #   pf_tps    prefill tok/s WHILE prefilling, from the cumulative
 #             `total_prefill_uncached_tokens` / `total_prefill_busy_us`
 #             counters between two samples (EWMA, >= PF_MIN_BUSY_S busy);
+#             Computed PER DP RANK and summed: each rank's scheduler adds the
+#             wall time of its own prefill steps, and under DP attention the
+#             ranks step together, so Σtok/Σbusy would cancel the rank count
+#             and report one rank's rate (8x low on a dp8 serve);
 #   pf_busy   prefill busy share as sglang counts it (only back-to-back prefill
 #             steps add time, so with --prefill-decode-interval 1 it
 #             UNDER-reads: a lower bound, display only; pf_tps is unaffected).
+#             The busiest rank's share (ranks overlap in wall time);
+#   pf_ranks  ranks that reported the counters (the gateway scales its rate
+#             clamp by it).
 # The gateway (engy-core registry knobs prefill_engine_backlog /
 # prefill_load_s) turns these into a backlog in seconds and routes on it.
 # Mirror of engy-core `engy.refminer.prefill_backlog_fields`; keep in sync.
@@ -355,15 +362,17 @@ PF_RATE_ALPHA = 0.3
 
 def prefill_backlog_fields(loads, prev):
     """(fields, new_state) from one /v1/loads `loads` list; `prev` is the
-    previous call's state for the same serve (None first). Fields are omitted
-    when the serve does not expose them. Pure; never raises."""
+    previous call's state for the same serve (None first). Ranks are keyed by
+    `dp_rank` (list position when absent). Fields are omitted when the serve
+    does not expose them. Pure; never raises."""
     fields: dict = {}
     if not isinstance(loads, list):
         return fields, prev
-    unc = tok = busy = 0
-    have_unc = have_ctr = False
+    unc = 0
+    have_unc = False
+    cur: dict = {}
     ts = None
-    for x in loads:
+    for i, x in enumerate(loads):
         if not isinstance(x, dict):
             continue
         try:
@@ -372,33 +381,43 @@ def prefill_backlog_fields(loads, prev):
                 have_unc = True
             if (x.get("total_prefill_uncached_tokens") is not None
                     and x.get("total_prefill_busy_us") is not None):
-                tok += int(x["total_prefill_uncached_tokens"])
-                busy += int(x["total_prefill_busy_us"])
-                have_ctr = True
+                r = x.get("dp_rank")
+                cur[i if r is None else int(r)] = (
+                    int(x["total_prefill_uncached_tokens"]),
+                    int(x["total_prefill_busy_us"]))
             if x.get("timestamp") is not None:
                 ts = max(ts or 0.0, float(x["timestamp"]))
         except (TypeError, ValueError):
             continue
     if have_unc:
         fields["uncached"] = unc
-    if not have_ctr:
+    if not cur:
         return fields, prev
     now = ts if ts is not None else time.time()
-    state = {"t": now, "tok": tok, "busy": busy,
-             "rate": (prev or {}).get("rate")}
-    if prev and now > prev.get("t", now):
-        d_tok = tok - prev["tok"]
-        d_busy_s = (busy - prev["busy"]) / 1e6
-        dt = now - prev["t"]
-        if d_tok >= 0 and d_busy_s >= 0:          # a serve restart resets both
-            fields["pf_busy"] = round(min(1.0, d_busy_s / dt), 4)
-            if d_busy_s >= PF_MIN_BUSY_S and d_tok > 0:
-                r = d_tok / d_busy_s
-                old = state["rate"]
-                state["rate"] = r if old is None else (
-                    PF_RATE_ALPHA * r + (1 - PF_RATE_ALPHA) * old)
-    if state["rate"]:
-        fields["pf_tps"] = int(state["rate"])
+    old_ranks = (prev or {}).get("ranks") or {}
+    dt = now - prev["t"] if prev and now > prev.get("t", now) else 0.0
+    ranks: dict = {}
+    shares = []
+    for k, (tok, busy) in cur.items():
+        o = old_ranks.get(k)
+        rate = o.get("rate") if o else None
+        if o and dt > 0:
+            d_tok = tok - o["tok"]
+            d_busy_s = (busy - o["busy"]) / 1e6
+            if d_tok >= 0 and d_busy_s >= 0:      # a serve restart resets both
+                shares.append(min(1.0, d_busy_s / dt))
+                if d_busy_s >= PF_MIN_BUSY_S and d_tok > 0:
+                    r = d_tok / d_busy_s
+                    rate = r if rate is None else (
+                        PF_RATE_ALPHA * r + (1 - PF_RATE_ALPHA) * rate)
+        ranks[k] = {"tok": tok, "busy": busy, "rate": rate}
+    state = {"t": now, "ranks": ranks}
+    fields["pf_ranks"] = len(ranks)
+    if shares:
+        fields["pf_busy"] = round(max(shares), 4)
+    total = sum(v["rate"] for v in ranks.values() if v["rate"])
+    if total:
+        fields["pf_tps"] = int(total)
     return fields, state
 
 
@@ -1059,8 +1078,9 @@ class Serve:
         fracs = []          # serves that report a fraction but no pool size
         got = False
         unc = None          # engine prefill backlog, summed over serves
-        tps = []            # (rate, weight) per serve for a combined rate
+        tps = []            # per-serve prefill rates (summed)
         busy = []
+        pf_ranks = 0        # DP ranks behind those rates
         try:
             timeout = httpx.Timeout(4.0, connect=3.0)
             async with httpx.AsyncClient(timeout=timeout) as c:
@@ -1095,6 +1115,8 @@ class Serve:
                             tps.append(pf["pf_tps"])
                         if "pf_busy" in pf:
                             busy.append(pf["pf_busy"])
+                        if pf.get("pf_ranks"):
+                            pf_ranks += pf["pf_ranks"]
                         got = True
                         continue
                     mtt = await self._max_total(c, root)
@@ -1130,6 +1152,8 @@ class Serve:
             kv["pf_tps"] = int(sum(tps))
         if busy:
             kv["pf_busy"] = round(max(busy), 4)
+        if pf_ranks:
+            kv["pf_ranks"] = pf_ranks
         return kv
 
     @staticmethod

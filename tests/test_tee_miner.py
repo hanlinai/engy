@@ -1080,7 +1080,54 @@ def test_v1_loads_carries_backlog_and_measured_rate(monkeypatch):
     kv2 = asyncio.run(s.kv_load())
     assert kv1["uncached"] == 15_757 and "pf_tps" not in kv1
     assert kv2["uncached"] == 0 and kv2["pf_tps"] == 16_666 and kv2["pf_busy"] == 0.2
-    assert kv2["frac"] == 0.92
+    assert kv2["frac"] == 0.92 and kv2["pf_ranks"] == 1
+
+
+def _dp(n, tok, busy_s, ts, busy_ranks=None):
+    busy_ranks = range(n) if busy_ranks is None else busy_ranks
+    return [{"dp_rank": r, "num_waiting_uncached_tokens": 0,
+             "total_prefill_uncached_tokens": tok if r in busy_ranks else 0,
+             "total_prefill_busy_us": int(busy_s * 1e6) if r in busy_ranks else 0,
+             "timestamp": ts} for r in range(n)]
+
+
+def test_dp_ranks_prefilling_together_sum_their_rates():
+    # dp8, every rank prefills 10k tok in the same 1 s: the serve did 80k tok/s.
+    # Each rank's busy counter adds that same second, so Σtok/Σbusy says 10k.
+    _, st = tm.prefill_backlog_fields(_dp(8, 0, 0, 100.0), None)
+    f, _ = tm.prefill_backlog_fields(_dp(8, 10_000, 1.0, 101.0), st)
+    assert f["pf_tps"] == 80_000 and f["pf_busy"] == 1.0 and f["pf_ranks"] == 8
+
+
+def test_dp_one_busy_rank_reports_its_rate_and_share():
+    _, st = tm.prefill_backlog_fields(_dp(8, 0, 0, 100.0), None)
+    f, _ = tm.prefill_backlog_fields(_dp(8, 2_500, 0.5, 102.0, busy_ranks={3}), st)
+    assert f["pf_tps"] == 5_000 and f["pf_busy"] == 0.25
+
+
+def test_dp_rank_keys_survive_reordering():
+    _, st = tm.prefill_backlog_fields(_dp(2, 0, 0, 0.0), None)
+    f, _ = tm.prefill_backlog_fields(
+        list(reversed(_dp(2, 6_000, 1.0, 1.0, busy_ranks={0}))), st)
+    assert f["pf_tps"] == 6_000
+
+
+def test_v1_loads_dp_serve_reports_summed_rate_and_ranks(monkeypatch):
+    base = SGLANG_V1_LOADS["loads"][0]
+    seq = [{"loads": [{**base, **x} for x in _dp(2, 0, 0, 1.0)]},
+           {"loads": [{**base, **x} for x in _dp(2, 17_000, 1.0, 31.0)]}]
+
+    def handler(request):
+        if request.url.path == "/v1/loads":
+            return tm.httpx.Response(200, json=seq.pop(0))
+        return tm.httpx.Response(404, text="nf")
+    real = tm.httpx.AsyncClient
+    monkeypatch.setattr(tm.httpx, "AsyncClient",
+                        lambda *a, **kw: real(*a, transport=tm.httpx.MockTransport(handler), **kw))
+    s = _kv_serve()
+    asyncio.run(s.kv_load())
+    kv = asyncio.run(s.kv_load())
+    assert kv["pf_tps"] == 34_000 and kv["pf_ranks"] == 2
 
 
 def test_older_v1_loads_has_no_backlog_keys(monkeypatch):
@@ -1094,7 +1141,7 @@ def test_prefill_fields_rate_is_busy_time_based_and_resets_safely():
                                         "total_prefill_uncached_tokens": 0,
                                         "total_prefill_busy_us": 0,
                                         "timestamp": 0.0}], None)
-    assert f == {"uncached": 5}
+    assert f == {"uncached": 5, "pf_ranks": 1}
     f, st = tm.prefill_backlog_fields([{"total_prefill_uncached_tokens": 17_000,
                                         "total_prefill_busy_us": 1_000_000,
                                         "timestamp": 10.0}], st)
