@@ -726,18 +726,39 @@ def _assistant_message(msg: dict) -> dict:
     return out
 
 
+#: A missing `prompt_tokens_details.cached_tokens` on the OpenAI wire means a
+#: cache hit of 0, not "unknown". True for sglang with --enable-cache-report:
+#: 0.5.20 drops the whole `prompt_tokens_details` block when nothing was
+#: cached, so without this a 0-hit request reached the gateway with no read
+#: count -- the first chunk carried no usage (gateway fell back to its
+#: estimate) and the final usage recorded a cache write of 0.
+#:
+#: OFF by default: the same absence is ALSO what a serve with no cache
+#: accounting sends (sglang without --enable-cache-report, vLLM without
+#: --enable-prompt-tokens-details), and there it really is unknown -- reporting
+#: 0 would make the gateway record the whole prompt as a cache write and send
+#: exact-looking cache headers it has no basis for. Set
+#: ENGY_CACHED_ZERO_DEFAULT=1 only when every serve behind this miner runs
+#: with cache reporting on (all first-party engy boxes do).
+_CACHED_ZERO_DEFAULT = os.environ.get("ENGY_CACHED_ZERO_DEFAULT", "0") not in ("", "0")
+
+
 def _clean_usage(raw: dict) -> dict:
     u = {"prompt_tokens": int(raw.get("prompt_tokens") or 0),
          "completion_tokens": int(raw.get("completion_tokens") or 0)}
     u["total_tokens"] = int(raw.get("total_tokens") or
                             u["prompt_tokens"] + u["completion_tokens"])
     details = raw.get("prompt_tokens_details")
+    prompt_details = {}
     if isinstance(details, dict):
         prompt_details = {key: int(details[key])
                           for key in ("cached_tokens", "cache_write_tokens")
                           if details.get(key) is not None}
-        if prompt_details:
-            u["prompt_tokens_details"] = prompt_details
+    if (_CACHED_ZERO_DEFAULT and "cached_tokens" not in prompt_details
+            and u["prompt_tokens"] > 0):
+        prompt_details["cached_tokens"] = 0      # see _CACHED_ZERO_DEFAULT
+    if prompt_details:
+        u["prompt_tokens_details"] = prompt_details
     # Thinking tokens, a SUBSET of completion_tokens. sglang reports this FLAT
     # on `usage.reasoning_tokens` (its own UsageInfo field); the gateway edge
     # translates it into OpenAI's nested `completion_tokens_details` before a
@@ -797,9 +818,12 @@ def _early_usage_from_chunk(usage) -> dict | None:
     if not isinstance(usage, dict):
         return None
     details = usage.get("prompt_tokens_details")
-    if not isinstance(details, dict):
-        return None
-    return _early_usage(usage.get("prompt_tokens"), details.get("cached_tokens"))
+    cached = details.get("cached_tokens") if isinstance(details, dict) else None
+    if cached is None:
+        if not _CACHED_ZERO_DEFAULT:
+            return None
+        cached = 0                               # see _CACHED_ZERO_DEFAULT
+    return _early_usage(usage.get("prompt_tokens"), cached)
 
 
 def _is_final_usage_event(ev: dict) -> bool:

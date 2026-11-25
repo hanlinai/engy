@@ -103,6 +103,7 @@ def test_k3_wire_usage_headers_feed_the_first_chunk(monkeypatch):
 
 def test_no_counts_means_no_usage_key(monkeypatch):
     # an older serve / no --enable-cache-report: nothing is guessed
+    monkeypatch.setattr(tm, "_CACHED_ZERO_DEFAULT", False)
     sse = _sse({"choices": [{"delta": {"content": "ok"}}],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 1,
                           "prompt_tokens_details": None}},
@@ -148,3 +149,87 @@ def test_serve_one_forwards_usage_on_the_first_chunk_frame_only():
                                   "prompt_tokens_details": {"cached_tokens": 0}}
     assert "usage" not in chunks[1]
     assert "usage" not in tm.P.chunk("c", {"content": "x"})
+
+
+# ENGY_CACHED_ZERO_DEFAULT: sglang 0.5.20 with --enable-cache-report omits
+# prompt_tokens_details entirely on a 0 cache hit (b300-tee-17, 2026-11-25).
+# On (our boxes): that absence is a 0 read. Off (repo default): unknown, as for
+# a serve with no cache accounting at all.
+
+def _omitted(pt, ct):
+    """sglang 0.5.20 --enable-cache-report usage on a 0-hit request."""
+    return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
+
+
+def test_cached_zero_default_is_off_unless_env_set():
+    import importlib
+    import os
+    saved = os.environ.pop("ENGY_CACHED_ZERO_DEFAULT", None)
+    try:
+        assert importlib.reload(tm)._CACHED_ZERO_DEFAULT is False
+        for v, want in (("1", True), ("0", False), ("", False)):
+            os.environ["ENGY_CACHED_ZERO_DEFAULT"] = v
+            assert importlib.reload(tm)._CACHED_ZERO_DEFAULT is want
+    finally:
+        os.environ.pop("ENGY_CACHED_ZERO_DEFAULT", None)
+        if saved is not None:
+            os.environ["ENGY_CACHED_ZERO_DEFAULT"] = saved
+        importlib.reload(tm)
+
+
+def test_clean_usage_omitted_details(monkeypatch):
+    monkeypatch.setattr(tm, "_CACHED_ZERO_DEFAULT", True)
+    assert tm._clean_usage(_omitted(4550, 2))["prompt_tokens_details"] == {
+        "cached_tokens": 0}
+    # details present but without cached_tokens: filled, other keys kept
+    assert tm._clean_usage({"prompt_tokens": 10, "prompt_tokens_details": {
+        "cache_write_tokens": 4}})["prompt_tokens_details"] == {
+        "cached_tokens": 0, "cache_write_tokens": 4}
+    # a reported count always wins
+    assert tm._clean_usage(FINAL)["prompt_tokens_details"] == {"cached_tokens": 4096}
+    # no prompt, nothing to claim
+    assert "prompt_tokens_details" not in tm._clean_usage({})
+    monkeypatch.setattr(tm, "_CACHED_ZERO_DEFAULT", False)
+    assert "prompt_tokens_details" not in tm._clean_usage(_omitted(4550, 2))
+    assert tm._clean_usage(FINAL)["prompt_tokens_details"] == {"cached_tokens": 4096}
+
+
+def test_early_usage_from_chunk_omitted_details(monkeypatch):
+    monkeypatch.setattr(tm, "_CACHED_ZERO_DEFAULT", True)
+    want = {"prompt_tokens": 4550, "prompt_tokens_details": {"cached_tokens": 0}}
+    assert tm._early_usage_from_chunk(_omitted(4550, 1)) == want
+    assert tm._early_usage_from_chunk(
+        {"prompt_tokens": 4550, "prompt_tokens_details": None}) == want
+    assert tm._early_usage_from_chunk(
+        {"prompt_tokens": 4550, "prompt_tokens_details": {}}) == want
+    assert tm._early_usage_from_chunk(_cu(4550, 1, 4096))["prompt_tokens_details"] \
+        == {"cached_tokens": 4096}
+    assert tm._early_usage_from_chunk({"prompt_tokens": 0}) is None
+    assert tm._early_usage_from_chunk(None) is None
+    monkeypatch.setattr(tm, "_CACHED_ZERO_DEFAULT", False)
+    assert tm._early_usage_from_chunk(_omitted(4550, 1)) is None
+    assert tm._early_usage_from_chunk(
+        {"prompt_tokens": 4550, "prompt_tokens_details": {}}) is None
+
+
+def test_stream_zero_hit_with_omitted_details_on(monkeypatch):
+    monkeypatch.setattr(tm, "_CACHED_ZERO_DEFAULT", True)
+    sse = _sse({"choices": [{"delta": {"content": "ok"}}], "usage": _omitted(4550, 1)},
+               {"choices": [{"delta": {"content": "!"}}], "usage": _omitted(4550, 2)},
+               {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+               {"choices": [], "usage": _omitted(4550, 2)})
+    _, out = _run(monkeypatch, sse)
+    deltas = [p for k, p in out if k == "delta"]
+    assert deltas[0]["usage"] == {"prompt_tokens": 4550,
+                                  "prompt_tokens_details": {"cached_tokens": 0}}
+    assert "usage" not in deltas[1]
+    assert out[-1][1]["usage"]["prompt_tokens_details"] == {"cached_tokens": 0}
+
+
+def test_stream_zero_hit_with_omitted_details_off(monkeypatch):
+    monkeypatch.setattr(tm, "_CACHED_ZERO_DEFAULT", False)
+    sse = _sse({"choices": [{"delta": {"content": "ok"}}], "usage": _omitted(4550, 1)},
+               {"choices": [], "usage": _omitted(4550, 2)})
+    _, out = _run(monkeypatch, sse)
+    assert "usage" not in out[0][1]
+    assert "prompt_tokens_details" not in out[-1][1]["usage"]
