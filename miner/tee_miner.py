@@ -872,8 +872,18 @@ class Serve:
     """
 
     def __init__(self, urls: list[str], served_model: str, read_timeout: float,
-                 dialect: dict | None = None):
+                 dialect: dict | None = None, health_urls: list[str] | None = None,
+                 load_urls: list[str] | None = None):
         self.urls = urls
+        # Behind a front such as sgl-router (PD disaggregation) the request url
+        # is not the engine: the router's /health answers 200 whatever its
+        # engines do, and it has no /get_load or /v1/loads. `health_urls` are
+        # engines that must ALL be healthy for this worker to take work (on top
+        # of the request urls, so a dead router still counts); `load_urls` are
+        # where kv_load / scheduler_alive read engine state. Both default to
+        # the request urls, i.e. no change for a plain serve.
+        self.health_urls = list(health_urls or [])
+        self.load_urls = list(load_urls or urls)
         self.served_model = served_model
         self.read_timeout = read_timeout
         self.dialect = dialect or _DEFAULT_DIALECT
@@ -934,9 +944,26 @@ class Serve:
                     worst = state
                 elif state == "dead":
                     worst = "dead"
+            # Engines behind the request url(s): every one is required, so the
+            # "another serve can still take work" relief does not apply.
+            extra = "ok"
+            for u in self.health_urls:
+                try:
+                    state = ("ok" if (await c.get(self._root(u) + "/health")
+                                      ).status_code == 200 else "dead")
+                except httpx.TimeoutException:
+                    state = "timeout"
+                except (httpx.NetworkError, httpx.RemoteProtocolError):
+                    state = "dead"
+                except Exception:
+                    state = "timeout"
+                if state == "dead" or (state == "timeout" and extra == "ok"):
+                    extra = state
         self._down = down
         if len(down) < len(self.urls) and worst == "dead":
             worst = "ok"                   # another serve can still take work
+        if extra == "dead" or (extra == "timeout" and worst == "ok"):
+            worst = extra
         return worst
 
     async def scheduler_alive(self, timeout: float = 3.0) -> bool:
@@ -959,7 +986,7 @@ class Serve:
         try:
             async with httpx.AsyncClient(
                     timeout=httpx.Timeout(timeout, connect=2.0)) as c:
-                for u in self.urls:
+                for u in self.load_urls:
                     try:
                         r = await c.get(self._root(u) + "/get_load")
                         if r.status_code == 200 and isinstance(r.json(), list):
@@ -1084,7 +1111,7 @@ class Serve:
         try:
             timeout = httpx.Timeout(4.0, connect=3.0)
             async with httpx.AsyncClient(timeout=timeout) as c:
-                for u in self.urls:
+                for u in self.load_urls:
                     root = self._root(u)
                     try:
                         r = await c.get(root + "/get_load")
@@ -2040,6 +2067,10 @@ async def _supervise(cfg, capacity: dict, load: Load):
 
 
 # ------------------------------------------------------------------------ main
+def _csv(v) -> list[str]:
+    return [u.strip() for u in (v or "").split(",") if u.strip()]
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         description="engy tee_miner (gateway leg for a TEE-attested worker)")
@@ -2055,6 +2086,15 @@ def main(argv=None):
     p.add_argument("--serve-url", dest="serve_url",
                    default=_env("ENGY_SERVE_URL", "http://127.0.0.1:8000"),
                    help="local serve base url, comma-separated for several")
+    p.add_argument("--health-urls", dest="health_urls",
+                   default=_env("ENGY_HEALTH_URLS", ""),
+                   help="engine base urls that must ALL answer /health, in "
+                        "addition to --serve-url (e.g. the prefill and decode "
+                        "engines behind an sgl-router), comma-separated")
+    p.add_argument("--load-urls", dest="load_urls",
+                   default=_env("ENGY_LOAD_URLS", ""),
+                   help="engine base urls to read KV load from instead of "
+                        "--serve-url, comma-separated")
     p.add_argument("--served-model", dest="served_model",
                    default=_env("ENGY_SERVED_MODEL"),
                    help="the serve's --served-model-name, if it differs")
@@ -2106,7 +2146,9 @@ def main(argv=None):
         "model_root": _model_root(args.checkpoint),
         "hw": _detect_hw(),
         "backend": Serve(serve_urls, args.served_model, args.read_timeout,
-                         resolve_dialect(args.model, args.dialect)),
+                         resolve_dialect(args.model, args.dialect),
+                         health_urls=_csv(args.health_urls),
+                         load_urls=_csv(args.load_urls)),
         "hb_s": HEARTBEAT_S,
     }
 
@@ -2119,6 +2161,8 @@ def main(argv=None):
           f"{', '.join(_host(u) for u in cfg['doors'].urls)} as {cfg['model']} "
           f"worker={worker_name} "
           f"root={cfg['model_root'][:12]} serves={serve_urls} "
+          f"health+={cfg['backend'].health_urls or '-'} "
+          f"load={cfg['backend'].load_urls} "
           f"total_inflight={cap['max_inflight']} "
           f"modalities={mods or ['text']}", flush=True)
     hw = cfg["hw"]
