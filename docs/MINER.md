@@ -104,6 +104,14 @@ what the gateway bills a prefix-cache read at its discounted rate — so leaving
 off does not break anything, it just charges your buyers full price for prompt
 prefixes the serve never recomputed.
 
+Some sglang versions (0.5.20 seen) with `--enable-cache-report` drop
+`prompt_tokens_details` entirely when **nothing** was cached. By default the
+miner treats that absence as "unknown" (it cannot tell it apart from a serve
+with no cache reporting). If every serve behind your miner runs with
+`--enable-cache-report`, set `ENGY_CACHED_ZERO_DEFAULT=1` so a missing count is
+forwarded as a 0 hit; the gateway then records accurate cache writes for
+cold requests.
+
 Wait until it answers:
 
 ```bash
@@ -148,6 +156,7 @@ in `public.models` and applied to every miner serving that model.
 | `GW` | `wss://<gateway-host>/gw` | gateway websocket URL — **required**, there is no default |
 | `MODEL` | e.g. `qwen3.6-35b-a3b` | the gateway's model id |
 | `MAX_INFLIGHT` | `--max-running-requests` × **dp-size** | **the one number you own. Minimum 8** — the gateway does not admit a smaller declaration. sglang's cap is **per DP replica**, so a dp=2 serve runs 2×. Under-set it and the gateway under-drives the serve; over-set it and requests queue past the model's timeout and are abandoned. |
+| `ENGY_CACHED_ZERO_DEFAULT` | `1` | only when every serve runs `--enable-cache-report`: a missing `cached_tokens` is forwarded as 0 instead of unknown (see §3). Default `0`. |
 | `ENGY_WORKER_NAME` | a name for **this machine** | only when several machines share one `MINER_KEY` — each registers as its own named worker. Default derives from hostname+model+serves. |
 
 `MAX_INPUT_TOKENS` / `MAX_OUTPUT_TOKENS` / `MAX_REQUEST_S` are still sent in the

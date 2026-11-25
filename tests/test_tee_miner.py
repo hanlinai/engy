@@ -491,7 +491,8 @@ def test_dialect_does_not_disturb_the_rest_of_the_body():
     assert body["max_tokens"] == 99 and body["temperature"] == 0.3
     assert body["tools"] == [1]
     assert body["stream"] is True
-    assert body["stream_options"] == {"include_usage": True}
+    assert body["stream_options"] == {"include_usage": True,
+                                      "continuous_usage_stats": True}
 
 
 # ---- prefix continuation: the keys the gateway's prefill.py sets ----
