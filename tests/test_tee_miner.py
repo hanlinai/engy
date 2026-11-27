@@ -1424,3 +1424,113 @@ def test_pd_kv_load_reads_the_engines_not_the_router(monkeypatch):
 def test_plain_serve_unchanged_without_health_or_load_urls():
     s = tm.Serve(["http://a:1", "http://b:2"], "/m", 60.0)
     assert s.health_urls == [] and s.load_urls == ["http://a:1", "http://b:2"]
+
+
+# ---- decode rate + PD per-role figures (2026-11-27) ----
+
+def _eng(mode=None, gen=None, run=0, unc=0, tok=0, busy_us=0, ts=1.0, rank=0):
+    x = {**SGLANG_V1_LOADS["loads"][0], "dp_rank": rank, "num_running_reqs": run,
+         "num_waiting_uncached_tokens": unc, "total_prefill_uncached_tokens": tok,
+         "total_prefill_busy_us": busy_us, "timestamp": ts}
+    if gen is not None:
+        x["gen_throughput"] = gen
+    if mode is not None:
+        x["disaggregation"] = {"mode": mode, "prefill_bootstrap_queue_reqs": 0}
+    return x
+
+
+def test_decode_fields_sum_ranks_and_omit_when_absent():
+    f = tm.decode_fields([_eng(gen=40.5, run=2, rank=0), _eng(gen=60.0, run=3, rank=1)])
+    assert f == {"gen_tps": 100.5, "gen_reqs": 5}
+    assert tm.decode_fields([_eng()]) == {}                 # older serve: omit
+    assert tm.decode_fields([_eng(gen="x")]) == {}          # unparseable: omit
+    assert tm.decode_fields([_eng(gen=0.0)]) == {"gen_tps": 0.0, "gen_reqs": 0}
+
+
+def test_engine_role_prefers_sglang_mode():
+    assert tm.engine_role([_eng(mode="prefill")]) == "prefill"
+    assert tm.engine_role([_eng(mode="decode")]) == "decode"
+    assert tm.engine_role([_eng(mode="null")]) == "null"
+    assert tm.engine_role([_eng()]) is None
+    assert tm.engine_role([_eng()], "decode") == "decode"
+    assert tm.engine_role([_eng(mode="null")], "prefill") == "null"   # loads wins
+
+
+def test_looks_like_prefill_heuristic():
+    assert tm.looks_like_prefill([_eng(gen=0.0, tok=5_000)])
+    assert not tm.looks_like_prefill([_eng(gen=30.0, tok=5_000)])     # decoding
+    assert not tm.looks_like_prefill([_eng(gen=0.0)])                 # no work
+    assert not tm.looks_like_prefill([_eng(tok=5_000)])               # no gen key
+
+
+def test_single_engine_reports_gen_tps_and_no_pd(monkeypatch):
+    _routes(monkeypatch, {"/v1/loads": (200, {"loads": [_eng(gen=90.0, run=6, unc=7)]})})
+    kv = asyncio.run(_kv_serve().kv_load())
+    assert kv["gen_tps"] == 90.0 and kv["gen_reqs"] == 6 and kv["uncached"] == 7
+    assert "pd" not in kv and kv["reqs"] == 6
+
+
+def test_single_engine_without_gen_throughput_omits_gen(monkeypatch):
+    _routes(monkeypatch, {"/v1/loads": (200, SGLANG_V1_LOADS)})
+    kv = asyncio.run(_kv_serve().kv_load())
+    assert "gen_tps" not in kv and "gen_reqs" not in kv and "pd" not in kv
+
+
+def _pd_seq(monkeypatch, dec_loads, pre_loads, info=None):
+    seq = {DEC: list(dec_loads), PRE: list(pre_loads)}
+    info = info or {}
+
+    def handler(request):
+        h = f"{request.url.host}:{request.url.port}"
+        if request.url.path == "/v1/loads" and h in seq:
+            return tm.httpx.Response(200, json={"loads": seq[h].pop(0)})
+        if request.url.path == "/get_server_info" and h in info:
+            return tm.httpx.Response(200, json=info[h])
+        return tm.httpx.Response(404, text="nf")
+    real = tm.httpx.AsyncClient
+    monkeypatch.setattr(tm.httpx, "AsyncClient",
+                        lambda *a, **kw: real(*a, transport=tm.httpx.MockTransport(handler), **kw))
+
+
+def test_pd_reports_prefill_backlog_from_prefill_and_decode_from_decode(monkeypatch):
+    _pd_seq(monkeypatch,
+            dec_loads=[[_eng("decode", gen=120.0, run=8, unc=999, tok=0, ts=1.0)],
+                       [_eng("decode", gen=120.0, run=8, unc=999, tok=0, ts=31.0)]],
+            pre_loads=[[_eng("prefill", gen=0.0, run=1, unc=50_000, tok=0, ts=1.0)],
+                       [_eng("prefill", gen=0.0, run=1, unc=40_000, tok=100_000,
+                             busy_us=5_000_000, ts=31.0)]])
+    s = _pd_serve()
+    asyncio.run(s.kv_load())
+    kv = asyncio.run(s.kv_load())
+    assert kv["pd"] is True
+    assert kv["uncached"] == 40_000                  # decode's 999 not added
+    assert kv["pf_tps"] == 20_000 and kv["pf_ranks"] == 1
+    assert kv["gen_tps"] == 120.0 and kv["gen_reqs"] == 8
+    assert kv["reqs"] == 9                           # old field unchanged: all engines
+
+
+def test_pd_role_from_server_info_when_loads_has_no_mode(monkeypatch):
+    _pd_seq(monkeypatch, dec_loads=[[_eng(gen=0.0, run=0)]],
+            pre_loads=[[_eng(gen=0.0, unc=3_000)]],
+            info={PRE: {"disaggregation_mode": "prefill"},
+                  DEC: {"disaggregation_mode": "decode"}})
+    kv = asyncio.run(_pd_serve().kv_load())
+    # idle decode engine is still "decode" (explicit), not mistaken for prefill
+    assert kv["pd"] is True and kv["uncached"] == 3_000
+    assert kv["gen_tps"] == 0.0 and kv["gen_reqs"] == 0
+
+
+def test_pd_heuristic_fallback_without_any_mode(monkeypatch):
+    _pd_seq(monkeypatch, dec_loads=[[_eng(gen=75.0, run=5)]],
+            pre_loads=[[_eng(gen=0.0, unc=2_000, tok=10_000)]])
+    kv = asyncio.run(_pd_serve().kv_load())
+    assert kv["pd"] is True and kv["uncached"] == 2_000
+    assert kv["gen_tps"] == 75.0 and kv["gen_reqs"] == 5
+
+
+def test_two_unified_serves_are_not_pd(monkeypatch):
+    _pd_seq(monkeypatch, dec_loads=[[_eng("null", gen=50.0, run=2, unc=10)]],
+            pre_loads=[[_eng("null", gen=0.0, run=0, unc=20, tok=10_000)]])
+    kv = asyncio.run(_pd_serve().kv_load())
+    assert "pd" not in kv and kv["uncached"] == 30
+    assert kv["gen_tps"] == 50.0 and kv["gen_reqs"] == 2
