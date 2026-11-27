@@ -526,6 +526,9 @@ def backlog_moved(prev, cur, min_tokens: int = BACKLOG_PUSH_MIN_TOKENS) -> bool:
     return abs(cur - prev) >= min_tokens
 
 
+BCAST_SEND_TIMEOUT_S = 2.0
+
+
 class Load:
     """In-flight count shared across every leg of this process. A per-leg
     counter would report only that leg's share, which is exactly the partial
@@ -535,6 +538,8 @@ class Load:
         self.inflight = 0
         self.last_idle = time.time()
         self._channels: set = set()
+        self._bcast_task = None
+        self._bcast_dirty = False
 
     def attach(self, ws):
         self._channels.add(ws)
@@ -590,13 +595,39 @@ class Load:
         Best-effort per leg. This runs on the request path and must never fail
         the request it describes, so a dead leg is dropped, never raised.
         """
-        for ws in list(self._channels):
+        frame = json.dumps(P.heartbeat(inflight=self.inflight,
+                                       idle_seconds=self.idle_seconds()))
+
+        async def one(ws):
             try:
-                await ws.send(json.dumps(P.heartbeat(
-                    inflight=self.inflight,
-                    idle_seconds=self.idle_seconds())))
+                await asyncio.wait_for(ws.send(frame), BCAST_SEND_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                pass                        # slow leg: skip this report, keep the leg
             except Exception:
                 self._channels.discard(ws)
+
+        chans = list(self._channels)
+        if chans:
+            await asyncio.gather(*(one(ws) for ws in chans))
+
+    def kick(self) -> None:
+        """Schedule a broadcast WITHOUT blocking the request path (11-25: an awaited,
+        sequential, timeout-less broadcast stalled every new request behind one slow leg).
+        Coalesced: at most one broadcast in flight; changes during it trigger one more."""
+        if self._bcast_task is not None and not self._bcast_task.done():
+            self._bcast_dirty = True
+            return
+        self._bcast_task = asyncio.get_running_loop().create_task(self._bcast_loop())
+
+    async def _bcast_loop(self) -> None:
+        while True:
+            self._bcast_dirty = False
+            try:
+                await self.broadcast()
+            except Exception:
+                pass
+            if not self._bcast_dirty:
+                return
 
 
 # ------------------------------------------------------------------ the lanes
@@ -1635,7 +1666,7 @@ async def _serve_one(ws, frame, backend: Serve, load: Load):
         # Report the acquire from INSIDE the try: `load.start()` has already
         # incremented, so anything raised here must still reach `finally` or the
         # slot leaks.
-        await load.broadcast()
+        load.kick()
         if is_text_completion(request):
             # Both raw-completion lanes answer in one shot. Streaming a span
             # score is meaningless: max_tokens is 0 and the payload is the
@@ -1670,7 +1701,7 @@ async def _serve_one(ws, frame, backend: Serve, load: Load):
         # advertised capacity permanently, and the count only ever drifts one
         # way, so the miner would slowly strangle itself.
         load.done()
-        await load.broadcast()
+        load.kick()
 
 
 async def _backlog_watch(load: Load, backend, interval: float = BACKLOG_PUSH_S):

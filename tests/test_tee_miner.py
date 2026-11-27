@@ -7,6 +7,7 @@ immediately, and that a drained leg outlives any request its backend may still
 be working on.
 """
 import asyncio
+import time
 import json
 import types
 import inspect
@@ -57,6 +58,17 @@ def test_broadcast_reaches_every_leg_not_just_the_one_serving():
         assert [h["inflight"] for h in ws.heartbeats()] == [1]
 
 
+def _serve_and_flush(ws, req, backend, load):
+    """Run one serve, then let the background broadcast it scheduled finish
+    (reports are kicked off the request path, so asyncio.run would otherwise
+    return before they are sent)."""
+    async def go():
+        await tm._serve_one(ws, req, backend, load)
+        while load._bcast_task is not None and not load._bcast_task.done():
+            await load._bcast_task
+    asyncio.run(go())
+
+
 def test_serve_one_reports_the_transition_at_both_ends():
     """Acquire AND release. Reporting only the acquire would leave a count that
     never comes back down until the next periodic frame."""
@@ -64,9 +76,12 @@ def test_serve_one_reports_the_transition_at_both_ends():
     load = tm.Load()
     load.attach(ws)
 
-    asyncio.run(tm._serve_one(ws, CHAT, FakeBackend(), load))
+    _serve_and_flush(ws, CHAT, FakeBackend(), load)
 
-    assert [h["inflight"] for h in ws.heartbeats()] == [1, 0]
+    # Reports are coalesced: a transition that is already over when the send
+    # runs is folded into the next one, but the last report is always the truth.
+    sent = [h["inflight"] for h in ws.heartbeats()]
+    assert sent and sent[-1] == 0
     assert load.inflight == 0
 
 
@@ -111,9 +126,10 @@ def test_serve_one_still_reports_the_release_when_the_backend_fails():
     load = tm.Load()
     load.attach(ws)
 
-    asyncio.run(tm._serve_one(ws, CHAT, Broken(), load))
+    _serve_and_flush(ws, CHAT, Broken(), load)
 
-    assert [h["inflight"] for h in ws.heartbeats()] == [1, 0]
+    sent = [h["inflight"] for h in ws.heartbeats()]
+    assert sent and sent[-1] == 0
 
 
 def test_drain_grace_outlives_the_upstream_read_timeout():
@@ -1607,3 +1623,29 @@ def test_serve_with_only_v1_loads_is_unchanged(monkeypatch):
     assert kv["reqs"] == 6 and kv["waiting"] == 4 and kv["pending"] == 0
     assert kv["uncached"] == 15_757 and kv["gen_tps"] == 88.5
     assert hits == ["/v1/loads"]
+
+
+def test_a_slow_leg_never_blocks_the_request_path():
+    """11-25: broadcast was awaited on the request path, sequentially and with
+    no timeout, so one backpressured leg stalled every new request before it
+    reached the serve (buyers gave up at ~15 s with no first token). kick()
+    must return at once, and a stuck leg must not starve the live ones."""
+    class Stuck(FakeWS):
+        async def send(self, frame):
+            await asyncio.sleep(3600)
+
+    stuck, live = Stuck(), FakeWS()
+    load = tm.Load()
+    load.attach(stuck)
+    load.attach(live)
+
+    async def go():
+        t0 = time.monotonic()
+        load.start()
+        load.kick()
+        assert time.monotonic() - t0 < 0.05
+        await asyncio.wait_for(load._bcast_task, tm.BCAST_SEND_TIMEOUT_S + 2)
+
+    asyncio.run(go())
+    assert [h["inflight"] for h in live.heartbeats()] == [1]
+    assert stuck in load._channels  # slow, not dead: kept for the next report
