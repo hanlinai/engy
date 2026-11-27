@@ -1222,7 +1222,7 @@ class Serve:
             return None
         if not isinstance(loads, list) or not loads:
             return None
-        used = reqs = waiting = limit = ranks = 0
+        used = reqs = waiting = pending = limit = ranks = 0
         for x in loads:
             if not isinstance(x, dict):
                 continue
@@ -1235,6 +1235,7 @@ class Serve:
             limit += mtt
             reqs += int(x.get("num_running_reqs", 0) or 0)
             waiting += int(x.get("num_waiting_reqs", 0) or 0)
+            pending += int(x.get("num_pending_tokens", 0) or 0)
             ranks += 1
         if not ranks:
             return None
@@ -1246,7 +1247,7 @@ class Serve:
             if role is None and looks_like_prefill(loads):
                 role = "prefill"
         return {"used": used, "reqs": reqs, "waiting": waiting, "ranks": ranks,
-                "limit": limit or None,
+                "pending": pending, "limit": limit or None,
                 "frac": round(used / limit, 4) if limit else None, "pf": pf,
                 "gen": decode_fields(loads), "role": role}
 
@@ -1278,8 +1279,10 @@ class Serve:
     async def kv_load(self):
         """Live KV-cache pressure across the local serve(s): tokens occupied vs
         the pool size, summed over every scheduler of every serve url, from
-        sglang `/get_load` + `max_total_num_tokens`, from a newer sglang's
-        `/v1/loads` (no /get_load), or for a vLLM serve from its /metrics. Cheap (two GETs per serve) and never
+        sglang `/v1/loads` (preferred: the only source of the prefill backlog,
+        decode rate and PD mode), else an older sglang's `/get_load` +
+        `max_total_num_tokens`, else a vLLM serve's /metrics. Cheap (one GET per
+        serve on a /v1/loads sglang) and never
         raises. Returns None if no serve exposes either (older sglang, or an
         engine that is neither) — the gateway then judges this worker on
         in-flight count alone."""
@@ -1297,23 +1300,32 @@ class Serve:
             async with httpx.AsyncClient(timeout=timeout) as c:
                 for u in self.load_urls:
                     root = self._root(u)
-                    try:
-                        r = await c.get(root + "/get_load")
-                        r.raise_for_status()
-                        load = r.json()
-                    except Exception:
-                        load = None
-                    if not isinstance(load, list) or not load:
-                        # Newer sglang serves load at /v1/loads instead of
-                        # /get_load; then fall through to a vLLM /metrics serve.
-                        v = await self._sglang_v1_loads(c, root)
-                        if v is None:
+                    # /v1/loads FIRST. sglang 0.5.20 (kimi-k3 B300s) answers
+                    # BOTH endpoints, and only /v1/loads carries the prefill
+                    # backlog (uncached/pf_tps/pf_busy), decode rate (gen_tps)
+                    # and PD mode; asking /get_load first starved the gateway
+                    # of all of those. /get_load (older sglang), then vLLM
+                    # /metrics, only when /v1/loads is not served — one probe
+                    # per serve when it is.
+                    v = await self._sglang_v1_loads(c, root)
+                    load = None
+                    if v is None:
+                        try:
+                            r = await c.get(root + "/get_load")
+                            r.raise_for_status()
+                            load = r.json()
+                        except Exception:
+                            load = None
+                        if not isinstance(load, list) or not load:
+                            load = None
                             v = await self._vllm_kv(c, root)
+                    if load is None:
                         if v is None:
                             continue
                         used += v["used"]
                         reqs += v["reqs"]
                         waiting += v["waiting"]
+                        pending += v.get("pending") or 0
                         ranks += v["ranks"]
                         if v["limit"]:
                             limit += v["limit"]

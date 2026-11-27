@@ -1534,3 +1534,76 @@ def test_two_unified_serves_are_not_pd(monkeypatch):
     kv = asyncio.run(_pd_serve().kv_load())
     assert "pd" not in kv and kv["uncached"] == 30
     assert kv["gen_tps"] == 50.0 and kv["gen_reqs"] == 2
+
+
+# ---- /v1/loads preferred over /get_load (2026-11-27) ----
+# sglang 0.5.20 (kimi-k3 B300s) answers BOTH endpoints. Asking /get_load first
+# meant the backlog (uncached/pf_*) and decode (gen_*) fields never reached the
+# gateway, so its prewarm idle gate saw "no signal" on those boxes forever.
+
+_REAL_ASYNC_CLIENT = tm.httpx.AsyncClient
+
+
+def _counting_routes(monkeypatch, routes):
+    hits = []
+
+    def handler(request):
+        hits.append(request.url.path)
+        status, body = routes.get(request.url.path, (404, "not found"))
+        if isinstance(body, str):
+            return tm.httpx.Response(status, text=body)
+        return tm.httpx.Response(status, json=body)
+    real = _REAL_ASYNC_CLIENT               # not a previous patch: re-patchable
+    monkeypatch.setattr(tm.httpx, "AsyncClient",
+                        lambda *a, **kw: real(*a, transport=tm.httpx.MockTransport(handler), **kw))
+    return hits
+
+
+# Same live state seen through both endpoints, as 216.137.78.93 serves it.
+_BOTH_GET_LOAD = [{"dp_rank": 0, "num_reqs": 6, "num_waiting_reqs": 4,
+                   "num_tokens": 10_613_473, "num_pending_tokens": 0}]
+_BOTH_V1 = {"loads": [{**SGLANG_V1_LOADS["loads"][0],
+                       "num_waiting_uncached_tokens": 15_757,
+                       "total_prefill_uncached_tokens": 100_000,
+                       "total_prefill_busy_us": 1_000_000, "timestamp": 1.0,
+                       "gen_throughput": 88.5}]}
+
+
+def test_serve_answering_both_uses_v1_loads_and_keeps_kv_numbers(monkeypatch):
+    # Old path (/get_load only): the reference numbers.
+    _counting_routes(monkeypatch, {
+        "/get_load": (200, _BOTH_GET_LOAD),
+        "/get_server_info": (200, {"max_total_num_tokens": 11536384 // 8,
+                                   "dcp_size": 8})})
+    old = asyncio.run(_kv_serve().kv_load())
+    hits = _counting_routes(monkeypatch, {
+        "/get_load": (200, _BOTH_GET_LOAD),
+        "/v1/loads": (200, _BOTH_V1),
+        "/get_server_info": (200, {"max_total_num_tokens": 11536384 // 8,
+                                   "dcp_size": 8})})
+    kv = asyncio.run(_kv_serve().kv_load())
+    assert kv["uncached"] == 15_757 and kv["gen_tps"] == 88.5 and kv["gen_reqs"] == 6
+    for k in ("limit", "reqs", "waiting", "ranks", "pending"):
+        assert kv[k] == old[k], k
+    assert abs(kv["used"] - old["used"]) <= 1000 and kv["frac"] == old["frac"]
+    assert hits == ["/v1/loads"]            # one probe; /get_load not also asked
+
+
+def test_serve_with_only_get_load_keeps_old_behaviour(monkeypatch):
+    hits = _counting_routes(monkeypatch, {
+        "/get_load": (200, [{"num_tokens": 500, "num_reqs": 2,
+                             "num_waiting_reqs": 1, "num_pending_tokens": 7}]),
+        "/get_server_info": (200, {"max_total_num_tokens": 100, "dcp_size": 10})})
+    kv = asyncio.run(_kv_serve().kv_load())
+    assert kv == {"used": 500, "reqs": 2, "waiting": 1, "pending": 7,
+                  "ranks": 1, "limit": 1000, "frac": 0.5}
+    assert hits[:2] == ["/v1/loads", "/get_load"] and "/metrics" not in hits
+
+
+def test_serve_with_only_v1_loads_is_unchanged(monkeypatch):
+    hits = _counting_routes(monkeypatch, {"/v1/loads": (200, _BOTH_V1)})
+    kv = asyncio.run(_kv_serve().kv_load())
+    assert kv["limit"] == 11536384 and kv["frac"] == 0.92 and kv["used"] == 10_613_473
+    assert kv["reqs"] == 6 and kv["waiting"] == 4 and kv["pending"] == 0
+    assert kv["uncached"] == 15_757 and kv["gen_tps"] == 88.5
+    assert hits == ["/v1/loads"]
