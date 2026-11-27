@@ -1,0 +1,48 @@
+# Fail when miner/tee_miner.py drifts from its pin in miner/RELEASE.json.
+#
+# RELEASE.json is what engy-provision installs on every TEE box (and what its
+# miner-upgrade command moves live boxes to). A tee_miner.py change that does
+# not refresh RELEASE.json would never reach the fleet, so it fails here.
+#
+# Only sha256 is enforced: RELEASE.json `commit` names a commit containing the
+# exact file and can lag the merge that lands it by one.
+#
+# Fix a failure with:
+#   python scripts/miner_release.py && git add miner/RELEASE.json
+
+name: Miner Release Pin
+
+on:
+  pull_request:
+    paths:
+      - "miner/tee_miner.py"
+      - "miner/RELEASE.json"
+      - "scripts/miner_release.py"
+      - ".github/workflows/miner-release.yml"
+  push:
+    branches: [main]
+    paths:
+      - "miner/tee_miner.py"
+      - "miner/RELEASE.json"
+      - "scripts/miner_release.py"
+      - ".github/workflows/miner-release.yml"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check RELEASE.json sha256 matches tee_miner.py
+        run: python scripts/miner_release.py --check

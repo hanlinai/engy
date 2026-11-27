@@ -60,6 +60,23 @@ import httpx
 import websockets
 
 
+def _file_version(path=__file__) -> str | None:
+    """First 12 hex of sha256 over the bytes of the running miner file.
+
+    This is the identity the fleet pins to (miner/RELEASE.json `sha256`), so
+    the gateway can show exactly which build every worker runs. Hashing the
+    file rather than stamping a constant means hand-copied or backported
+    copies report what they really are. Never fatal."""
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:12]
+    except OSError:
+        return None
+
+
+MINER_VERSION = _file_version()
+
+
 # --------------------------------------------------------------- wire protocol
 # Inlined so this file stands alone. Mirrors engy/pool/protocol.py; frames are
 # plain JSON dicts keyed by "type".
@@ -79,12 +96,14 @@ class P:
 
     @staticmethod
     def hello(miner_key, model, model_root, hw=None, capacity=None,
-              worker_name="", worker_id=None):
+              worker_name="", worker_id=None, miner_version=None):
         f = {"type": P.HELLO, "miner_key": miner_key, "model": model,
              "model_root": model_root, "hw": hw or {}, "versions": {},
              "capacity": capacity or {}, "worker_name": worker_name}
         if worker_id:
             f["worker_id"] = worker_id
+        if miner_version:          # optional: gateways that predate it ignore it
+            f["miner_version"] = miner_version
         return f
 
     @staticmethod
@@ -1839,8 +1858,10 @@ async def _session(ws, cfg, cap, load: Load, tag: str,
     await ws.send(json.dumps(P.hello(
         cfg["miner_key"], cfg["model"], cfg["model_root"], hw=cfg["hw"],
         capacity=cap, worker_name=cfg["worker_name"],
-        worker_id=cfg.get("worker_id"))))
-    print(f"[tee_miner] {tag} HELLO sent (max_inflight={cap['max_inflight']})",
+        worker_id=cfg.get("worker_id"),
+        miner_version=cfg.get("miner_version", MINER_VERSION))))
+    print(f"[tee_miner] {tag} HELLO sent (max_inflight={cap['max_inflight']}, "
+          f"miner_version={cfg.get('miner_version', MINER_VERSION)})",
           flush=True)
     hb = asyncio.create_task(
         _heartbeat(ws, cfg.get("hb_s", HEARTBEAT_S), load, cap, cfg["backend"]))

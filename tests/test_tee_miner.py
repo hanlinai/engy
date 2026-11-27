@@ -1262,6 +1262,34 @@ def test_session_hello_without_cfg_worker_id_omits_it():
     assert "worker_id" not in ws.sent[0]
 
 
+def test_miner_version_is_sha256_prefix_of_the_running_file():
+    import hashlib
+    with open(tm.__file__, "rb") as f:
+        want = hashlib.sha256(f.read()).hexdigest()[:12]
+    assert tm.MINER_VERSION == want
+
+
+def test_file_version_of_missing_file_is_none(tmp_path):
+    assert tm._file_version(str(tmp_path / "gone.py")) is None
+
+
+def test_hello_miner_version_is_optional():
+    assert "miner_version" not in tm.P.hello("k", "m", "r")
+    assert tm.P.hello("k", "m", "r", miner_version="abc")["miner_version"] == "abc"
+
+
+def test_session_hello_carries_miner_version():
+    ws = _AdmitWS({"type": tm.P.ADMIT})
+    _run_session(ws, _name_cfg())
+    assert ws.sent[0]["miner_version"] == tm.MINER_VERSION
+
+
+def test_session_hello_cfg_miner_version_overrides():
+    ws = _AdmitWS({"type": tm.P.ADMIT})
+    _run_session(ws, _name_cfg(miner_version="feedbeef0000"))
+    assert ws.sent[0]["miner_version"] == "feedbeef0000"
+
+
 def test_admit_worker_id_is_printed_once_per_process(monkeypatch, capsys):
     monkeypatch.setattr(tm, "_worker_id_announced", False)
     for _ in range(3):
