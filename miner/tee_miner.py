@@ -427,6 +427,83 @@ def prefill_backlog_fields(loads, prev):
     return fields, state
 
 
+
+# ------------------------------------------------- decode rate + PD roles
+# Idle-gated prewarm (2026-11-27): the gateway only prewarms an engine that is
+# truly idle -- no queued uncached prefill AND decode per request above a
+# floor. Decode per request = gen_tps / gen_reqs, from the same /v1/loads:
+#   gen_tps   Σ `gen_throughput` (decode tok/s, per DP rank) over the
+#             decode-capable engines; omitted when no engine reports it (a real
+#             0.0 from an idle engine IS sent);
+#   gen_reqs  Σ `num_running_reqs` over those same engines (the denominator;
+#             `reqs` keeps its old meaning, every engine summed);
+#   pd        true when the load-urls are a PD pair (some engine reports the
+#             prefill role); then uncached / pf_tps / pf_busy / pf_ranks come
+#             from the prefill engine(s) only and gen_* from the decode one(s).
+# Role: sglang's own disaggregation mode -- /v1/loads `disaggregation.mode`
+# per rank ("prefill" | "decode" | "null"), else /get_server_info
+# `disaggregation_mode`. Only when neither says, and more than one load-url is
+# configured, an engine with no decode output (gen_throughput ~0) that shows
+# prefill work (counters or uncached backlog) is taken as prefill. That guess
+# can only move backlog fields between engines of ONE worker, never invent one.
+GEN_IDLE_TPS = 0.5
+
+
+def engine_role(loads, info_mode=None):
+    """'prefill' | 'decode' | 'null' (sglang says: not disaggregated) | None
+    (not reported) for one serve, from the /v1/loads `loads` list, else
+    `info_mode` (/get_server_info `disaggregation_mode`). Pure; never raises."""
+    for x in loads if isinstance(loads, list) else ():
+        d = x.get("disaggregation") if isinstance(x, dict) else None
+        m = d.get("mode") if isinstance(d, dict) else None
+        if m in ("prefill", "decode", "null"):
+            return m
+    return info_mode if info_mode in ("prefill", "decode", "null") else None
+
+
+def looks_like_prefill(loads) -> bool:
+    """Heuristic fallback when no explicit mode is reported: no decode output
+    on any rank, and prefill work seen. Pure; never raises."""
+    gen = work = 0.0
+    seen = False
+    for x in loads if isinstance(loads, list) else ():
+        if not isinstance(x, dict):
+            continue
+        try:
+            if x.get("gen_throughput") is not None:
+                gen += float(x["gen_throughput"])
+                seen = True
+            work += float(x.get("total_prefill_uncached_tokens") or 0)
+            work += float(x.get("num_waiting_uncached_tokens") or 0)
+        except (TypeError, ValueError):
+            return False
+    return seen and gen < GEN_IDLE_TPS and work > 0
+
+
+def decode_fields(loads) -> dict:
+    """{gen_tps, gen_reqs} from one /v1/loads `loads` list; {} when no rank
+    reports `gen_throughput`. Pure; never raises."""
+    tps = 0.0
+    reqs = 0
+    seen = False
+    for x in loads if isinstance(loads, list) else ():
+        if not isinstance(x, dict):
+            continue
+        try:
+            g = x.get("gen_throughput")
+            if g is None:
+                continue
+            g = float(g)
+            n = int(x.get("num_running_reqs", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if g != g or g < 0:                 # NaN / garbage
+            continue
+        tps += g
+        reqs += max(0, n)
+        seen = True
+    return {"gen_tps": round(tps, 1), "gen_reqs": reqs} if seen else {}
+
 # Event-driven backlog push. The 10 s heartbeat is too slow for a backlog that
 # jumps by a whole cold 300k prompt in one request: every ENGY_BACKLOG_PUSH_S
 # one process-wide task re-reads the serve and pushes a kv frame to every leg
@@ -976,6 +1053,7 @@ class Serve:
         self._mtt: dict = {}   # per-serve KV pool size, cached (fixed per serve)
         self._mtt_retry: dict = {}   # per-serve: earliest monotonic retry
         self._pf_prev: dict = {}     # per-serve /v1/loads prefill counters
+        self._mode: dict = {}        # per-serve /get_server_info PD mode
 
     def _pick(self) -> str:
         pool = [u for u in self.urls if u not in self._down] or self.urls
@@ -1162,9 +1240,30 @@ class Serve:
             return None
         pf, self._pf_prev[root] = prefill_backlog_fields(
             loads, self._pf_prev.get(root))
+        role = engine_role(loads)
+        if role is None and len(self.load_urls) > 1:
+            role = engine_role(loads, await self._pd_mode(c, root))
+            if role is None and looks_like_prefill(loads):
+                role = "prefill"
         return {"used": used, "reqs": reqs, "waiting": waiting, "ranks": ranks,
                 "limit": limit or None,
-                "frac": round(used / limit, 4) if limit else None, "pf": pf}
+                "frac": round(used / limit, 4) if limit else None, "pf": pf,
+                "gen": decode_fields(loads), "role": role}
+
+    async def _pd_mode(self, c, root: str):
+        """sglang `disaggregation_mode` of the serve at `root` from
+        /get_server_info, cached once answered (fixed per serve); None if it
+        does not say. Only asked when /v1/loads carries no mode."""
+        if root in self._mode:
+            return self._mode[root]
+        try:
+            r = await c.get(root + "/get_server_info")
+            r.raise_for_status()
+            m = (r.json() or {}).get("disaggregation_mode")
+        except Exception:
+            return None
+        self._mode[root] = m if m in ("prefill", "decode", "null") else None
+        return self._mode[root]
 
     async def _vllm_kv(self, c, root: str):
         """KV pressure of a vLLM serve at `root`, from its /metrics. None if the
@@ -1192,6 +1291,7 @@ class Serve:
         tps = []            # per-serve prefill rates (summed)
         busy = []
         pf_ranks = 0        # DP ranks behind those rates
+        engines = []        # (role, pf, gen) per /v1/loads serve, for PD
         try:
             timeout = httpx.Timeout(4.0, connect=3.0)
             async with httpx.AsyncClient(timeout=timeout) as c:
@@ -1220,6 +1320,7 @@ class Serve:
                         else:
                             fracs.append(v["frac"])
                         pf = v.get("pf") or {}
+                        engines.append((v.get("role"), pf, v.get("gen") or {}))
                         if "uncached" in pf:
                             unc = (unc or 0) + pf["uncached"]
                         if pf.get("pf_tps"):
@@ -1255,6 +1356,19 @@ class Serve:
             # A serve with no pool size can only say how full it is. Report the
             # fullest view rather than diluting it with a pool it isn't part of.
             kv["frac"] = round(max([kv.get("frac") or 0.0] + fracs), 4)
+        pd = (len(self.load_urls) > 1
+              and any(r == "prefill" for r, _, _ in engines))
+        if pd:
+            # PD pair: the backlog that delays a new request is the prefill
+            # engine's; the decode engine's prefill counters are KV-transfer
+            # noise. Re-derive the backlog fields from prefill engines only.
+            kv["pd"] = True
+            pre = [pf for r, pf, _ in engines if r == "prefill"]
+            unc = (sum(p["uncached"] for p in pre if "uncached" in p)
+                   if any("uncached" in p for p in pre) else None)
+            tps = [p["pf_tps"] for p in pre if p.get("pf_tps")]
+            busy = [p["pf_busy"] for p in pre if "pf_busy" in p]
+            pf_ranks = sum(p.get("pf_ranks") or 0 for p in pre)
         if unc is not None:
             kv["uncached"] = unc
         if tps:
@@ -1265,6 +1379,10 @@ class Serve:
             kv["pf_busy"] = round(max(busy), 4)
         if pf_ranks:
             kv["pf_ranks"] = pf_ranks
+        gens = [g for r, _, g in engines if g and not (pd and r == "prefill")]
+        if gens:
+            kv["gen_tps"] = round(sum(g["gen_tps"] for g in gens), 1)
+            kv["gen_reqs"] = sum(g["gen_reqs"] for g in gens)
         return kv
 
     @staticmethod
